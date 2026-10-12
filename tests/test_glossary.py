@@ -373,6 +373,270 @@ def test_a_split_term_renders_exactly_as_the_unsplit_one_would():
     assert sentences_of(corrected) == ["Hallo daar.", "WHYcast.", "Tot ziens."]
 
 
+def _read(words, terms):
+    return render.join_text(apply_in_memory(words, glossary.corrections_for(words, terms)))
+
+
+def test_a_term_already_spelled_across_two_words_is_not_corrected_inside():
+    """TASK-103. Whisper can emit the second half of a word without a leading
+    space, so " My" + "Scribe" already reads "MyScribe". That two-word window
+    is already right; it used to be dropped, which left "Scribe" (85.7
+    against "MyScribe") free to be corrected on its own: "MyMyScribe"."""
+    assert _read(_words([" in", " My", "Scribe"]), [term("MyScribe")]) == "in MyScribe"
+    assert _read(_words(["My", "Scribe"]), [term("MyScribe")]) == "MyScribe"
+    # The stored shape with a space between them was never affected; pinned.
+    assert _read(words_from("in My Scribe"), [term("MyScribe")]) == "in MyScribe"
+
+
+def test_an_already_spelled_term_blocks_its_own_prefix_and_suffix_too():
+    """The same bug from both ends: "Notebook" alone is 88.9 against
+    "NotebookLM" and "Smithson" alone 88.9 against "J Smithson"."""
+    assert _read(_words([" via", " Notebook", "LM"]), [term("NotebookLM")]) == "via NotebookLM"
+    assert _read(words_from("met J Smithson dus"), [term("J Smithson")]) == "met J Smithson dus"
+
+
+def test_a_longer_correction_still_beats_a_shorter_term_already_spelled():
+    """An exact "Marieke" claims one word; a two-word correction starting at
+    the same word reaches past it and must still win."""
+    words = words_from("Ik sprak Marieke Vermulen gisteren.")
+
+    assert _read(words, [term("Marieke"), term("Marieke Vermeulen")]) == (
+        "Ik sprak Marieke Vermeulen gisteren."
+    )
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    ["Ik sprak Jansen u gisteren", "Ik sprak Janssen u gisteren"],
+)
+def test_a_name_spelled_as_one_term_is_left_alone_next_to_its_near_twin(sentence):
+    """A glossary with Jansen and Janssen. Each is a wanted spelling, so a
+    word already spelled as either is left as it is - and the short word after
+    it stays. "Janssen u" is 87.5 against "Janssen", and 80 against "Jansen"
+    with the same metaphone (JNSN): either used to swallow the "u"."""
+    assert _read(words_from(sentence), [term("Jansen"), term("Janssen")]) == sentence
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    ["Ik sprak Thomas u gisteren", "Ik sprak Tomas u gisteren"],
+)
+def test_thomas_and_tomas_both_stay_and_keep_the_word_after_them(sentence):
+    """"Tomas u" is 83.3 against "Tomas" and sounds the same, so it was
+    claimed as a phonetic correction that emptied "u"."""
+    assert _read(words_from(sentence), [term("Thomas"), term("Tomas")]) == sentence
+
+
+@pytest.mark.parametrize(
+    ("sentence", "name"),
+    [
+        ("Ik sprak Vermeulen en Piet", "Vermeulen"),
+        ("Ik vind NotebookLM is goed", "NotebookLM"),
+        ("Ik woon Amsterdam en Piet", "Amsterdam"),
+    ],
+)
+def test_a_long_term_spelled_right_does_not_swallow_the_short_word_after_it(sentence, name):
+    """A long name plus a two-letter word still scores 85.7-87.0 against the
+    name alone - at the threshold - so the pair was "corrected" to the name
+    and the short word deleted. Older than TASK-103."""
+    assert _read(words_from(sentence), [term(name)]) == sentence
+
+
+@pytest.mark.parametrize(
+    ("sentence", "terms", "expected"),
+    [
+        ("Ik woon in Amsterdam.", ["Amsterdam"], "Ik woon in Amsterdam."),
+        (
+            "Ik sprak met Marieke Vermeulen gisteren.",
+            ["Marieke Vermeulen"],
+            "Ik sprak met Marieke Vermeulen gisteren.",
+        ),
+        ("Dag u Jansen gisteren", ["Jansen", "Janssen"], "Dag u Jansen gisteren"),
+        ("Dag u Jansen gisteren", ["Janssen"], "Dag u Janssen gisteren"),
+    ],
+)
+def test_the_word_before_a_term_is_not_swallowed_by_it(sentence, terms, expected):
+    """TASK-110. "in amsterdam" is 90 against "Amsterdam" on WRatio and 85.7
+    on ratio - at the threshold - so the two-word window was replaced by the
+    name and "in" was gone. The window holds the term, it is not the term."""
+    assert _read(words_from(sentence), [term(t) for t in terms]) == expected
+
+
+@pytest.mark.parametrize(
+    ("sentence", "terms", "expected"),
+    [
+        ("Zie Git Hub vandaag", ["Git", "GitHub"], "Zie GitHub vandaag"),
+        ("Zie My Scribe vandaag", ["My", "MyScribe"], "Zie MyScribe vandaag"),
+        ("Zie Mi Scribe vandaag", ["MyScribe"], "Zie MyScribe vandaag"),
+        ("Zie Notebook LM vandaag", ["Notebook", "NotebookLM"], "Zie NotebookLM vandaag"),
+        ("Zie Jan sen vandaag", ["Jan", "Jansen"], "Zie Jansen vandaag"),
+    ],
+)
+def test_a_split_term_is_joined_even_when_its_first_half_is_a_term(sentence, terms, expected):
+    """"Git" is spelled right and claims its word, but "Git Hub" is the
+    longer window and both its words are part of "GitHub"."""
+    assert _read(words_from(sentence), [term(t) for t in terms]) == expected
+
+
+@pytest.mark.parametrize(
+    ("sentence", "name", "expected"),
+    [
+        ("Zie Mai Scribe vandaag", "MyScribe", "Zie MyScribe vandaag"),
+        ("Zie Mei Scribe vandaag", "MyScribe", "Zie MyScribe vandaag"),
+        ("Zie Pie Torch vandaag", "PyTorch", "Zie PyTorch vandaag"),
+        ("Zie pie torch vandaag", "PyTorch", "Zie PyTorch vandaag"),
+    ],
+)
+def test_a_split_term_whose_first_half_only_sounds_right_is_joined(sentence, name, expected):
+    """"Mai" against the leftover "my" is 40 on spelling, but both are 'M' on
+    metaphone; the edge word is accounted for by sound. Refused, the lone
+    "Scribe" was respelled on its own: "Mai MyScribe" (the TASK-103 shape)."""
+    assert _read(words_from(sentence), [term(name)]) == expected
+
+
+@pytest.mark.parametrize(
+    ("sentence", "name", "expected"),
+    [
+        ("Zie Linked In vandaag", "LinkedIn", "Zie LinkedIn vandaag"),
+        ("Zie Dendermon de vandaag", "Dendermonde", "Zie Dendermonde vandaag"),
+        ("Zie Tint in vandaag", "Tintin", "Zie Tintin vandaag"),
+    ],
+)
+def test_a_split_term_is_cut_where_its_halves_meet_not_where_a_half_first_occurs(
+    sentence, name, expected
+):
+    """"in" first occurs at the start of "linkedin" ("l-IN-kedin"); aligned
+    there, the leftover for "Linked" was "l" (28.6) and the join was refused.
+    The rest of the window is the start (or the end) of the term, so the cut
+    is anchored to that end."""
+    assert _read(words_from(sentence), [term(name)]) == expected
+
+
+@pytest.mark.parametrize("short", ["u", "en", "a", "in", "is"])
+@pytest.mark.parametrize(
+    "name", ["MyScribe", "PyTorch", "LinkedIn", "Dendermonde", "Amsterdam", "Vermeulen"]
+)
+def test_a_short_word_next_to_a_term_is_never_joined_to_it(short, name):
+    """Neither the anchored cut nor the sound rule may let a function word
+    become a piece of the term it stands next to (TASK-110)."""
+    for sentence in (f"Ik zag {short} {name} gisteren", f"Ik zag {name} {short} gisteren"):
+        assert _read(words_from(sentence), [term(name)]) == sentence
+
+
+def test_a_term_spelled_right_is_not_joined_to_the_next_word_on_sound_alone():
+    """With "Dirk" and "Dirks" listed, "Dirk is" is 83.3 against "Dirks" and
+    sounds like it (TRKS), but "is" against the leftover "s" is 66.7 on
+    spelling - under `PAST_CLAIM_FLOOR`. That is not enough to respell a name
+    already spelled right and drop "is"."""
+    sentence = "Ik zag Dirk is gisteren"
+
+    assert _read(words_from(sentence), [term("Dirk"), term("Dirks")]) == sentence
+
+
+@pytest.mark.parametrize(
+    ("first", "patronymic", "sentence"),
+    [
+        ("Peter", "Peters", "Peter is ziek"),
+        ("Simon", "Simons", "Simon is thuis"),
+        ("Willem", "Willems", "Willem is thuis"),
+        ("Jacob", "Jacobs", "Jacob is thuis"),
+        ("Robert", "Roberts", "Robert is thuis"),
+    ],
+)
+def test_a_first_name_next_to_its_listed_patronymic_keeps_the_verb(first, patronymic, sentence):
+    """With "Peter" and "Peters" both listed, "Peter is" is a fuzzy match for
+    "Peters" (the "is" leaves "s", 66.7 on spelling) and a correction over
+    more words than the exact "Peter" claims, so without a floor it wins:
+    "Peters ziek". Before TASK-103 the name was respelled but "is" kept.
+    An exact listed spelling is left alone,
+    and a word past it joins the term only if it is spelled as the rest."""
+    assert _read(words_from(sentence), [term(first), term(patronymic)]) == sentence
+
+
+def test_a_lone_listed_patronymic_still_respells_the_first_name():
+    """No claim without "Peter" listed: "Peter" alone is the fuzzy match for
+    "Peters" and "is" stays, as before TASK-103."""
+    assert _read(words_from("Peter is ziek"), [term("Peters")]) == "Peters is ziek"
+
+
+def test_a_word_with_a_vowel_does_not_sound_like_a_leftover_without_one():
+    """With "Sanders" listed, "zo anders" leaves "s" for "zo": nothing alike
+    on spelling, but both are 'S' on metaphone, which drops the vowel, so
+    "zo" was joined and deleted. "anders" alone is still a fuzzy match for
+    "Sanders"."""
+    assert _read(words_from("dat is zo anders"), [term("Sanders")]) == "dat is zo Sanders"
+
+
+@pytest.mark.parametrize(
+    ("sentence", "name", "expected"),
+    [
+        ("Ik zag Z interklaas vandaag", "Sinterklaas", "Ik zag Sinterklaas vandaag"),
+        ("Ik zag F ermeulen vandaag", "Vermeulen", "Ik zag Vermeulen vandaag"),
+        ("Ik zag S andvoort vandaag", "Zandvoort", "Ik zag Zandvoort vandaag"),
+    ],
+)
+def test_a_one_letter_split_without_a_vowel_still_joins_on_sound(sentence, name, expected):
+    """The vowel rule, not a length rule: "Z" against the leftover "s" has no
+    vowel to lose and sounds the same. Refusing every one-letter leftover
+    left the piece standing next to the respelled rest: "Z Sinterklaas"."""
+    assert _read(words_from(sentence), [term(name)]) == expected
+
+
+@pytest.mark.parametrize(
+    ("sentence", "terms"),
+    [
+        ("We sent Marie a card", ["Marie", "Maria"]),
+        ("I gave Anne a book yesterday", ["Anne", "Anna"]),
+        ("ik zag Lise a daar", ["Lise", "Lisa"]),
+        ("We sent Sophie a card", ["Sophie", "Sophia"]),
+        ("ik zag Sophia e daar", ["Sophia", "Sophie"]),
+        ("We sent Louise a card", ["Louise", "Louisa"]),
+    ],
+)
+def test_a_listed_name_is_not_respelled_as_another_listed_name_past_its_article(
+    sentence, terms
+):
+    """"Marie a" sounds like "Maria" (83.3 on spelling, below the fuzzy
+    threshold), and "a" is exactly the rest of it. Only a fuzzy correction
+    beats a claim, so with both names listed "Marie" keeps its word and "a"
+    stays. Before TASK-103 this read "Marie card"; letting a phonetic join beat the
+    claim read "Maria card" - the article gone and the wrong person named.
+    "Sophie a" is a fuzzy match for "Sophia", but a correction past a claim
+    must extend the claimed term, not respell its end."""
+    assert _read(words_from(sentence), [term(t) for t in terms]) == sentence
+
+
+@pytest.mark.parametrize(
+    ("sentence", "terms", "expected"),
+    [
+        (
+            "met Jose Mourino en",
+            [term("Jose"), term("José Mourinho")],
+            "met José Mourinho en",
+        ),
+        (
+            "met Mai Scribe en",
+            [term("Mai"), term("MyScribe", variants=("Mai Scribe",))],
+            "met MyScribe en",
+        ),
+    ],
+)
+def test_a_correction_past_a_claim_extends_it_up_to_accents_and_variants(
+    sentence, terms, expected
+):
+    """"Jose" is the start of "José Mourinho" once the accent is set aside,
+    and "Mai" the start of the variant "Mai Scribe" that matched. Comparing
+    only against the canonical spelling refused both, and the variant case
+    read "Mai MyScribe"."""
+    assert _read(words_from(sentence), terms) == expected
+
+
+def test_an_accented_vowel_is_a_vowel():
+    """"zó" (emphatic, as Whisper may write it) has a vowel; without one it
+    would be 'S' against the "s" of "Sanders" and be deleted."""
+    assert _read(words_from("dat is zó anders"), [term("Sanders")]) == "dat is zó Sanders"
+
+
 def apply_in_memory(words: list[dict], fixes: list[glossary.Correction]) -> list[dict]:
     """The read-time join, done by hand: what the LEFT JOIN produces."""
     by_idx = {fix.word_idx: fix.corrected for fix in fixes}
