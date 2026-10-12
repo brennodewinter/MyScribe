@@ -53,9 +53,66 @@ as `fuzzy`; one between `PHONETIC_FLOOR` and that threshold is corrected as
 `phonetic` only if it *sounds* the same (`jellyfish.metaphone`, whitespace
 removed first so a term Whisper split still rhymes with itself).
 
-Known and accepted: a plural of a term ("mariekes" against "Marieke", 93.3)
-is corrected. A glossary is a statement that this spelling is wanted; the
-layer is visible in the transcript and reversible in one DELETE.
+A window of several words is a candidate only if each of its edge words is a
+piece of the term (`_covers`). A term next to a short word still scores at
+the threshold against the term alone - "in Amsterdam" 85.7, "Vermeulen en"
+85.7, "NotebookLM is" 87.0 - and replacing the window deleted the short word
+(TASK-110). So for the last word, the rest of the window is the start of the
+term: cut the term where that start matches best, and the piece after the
+cut must be the word - spelled within `EDGE_WORD_FLOOR`, or with the same
+metaphone. The same for the first word, with the rest as the end of the term.
+"Git Hub" leaves "hub" (100), "Mi Scribe" leaves "my" for "mi" (50), "Mai
+Scribe" leaves "my" for "mai" (40, but 'M' both ways), "in Amsterdam" leaves
+nothing for "in". Anchored to the end, not searched for: "in" first occurs
+in "l-IN-kedin", and aligned there it left "l" for "Linked". A word with a
+vowel never sounds like a leftover without one: metaphone drops the vowel,
+so with "Sanders" listed "zo anders" left "s" for "zo", 'S' both ways, and
+"zo" was deleted. "Z interklaas" still leaves "s" for "z".
+
+Overlapping windows are settled left to right: at each word the best-scoring
+window that starts there wins (a tie goes to the longer one) and the words it
+covers are skipped. A window already spelled the way the glossary wants it
+claims its words and writes nothing. Dropping it instead let a piece of the
+term be corrected on its own: " My" + "Scribe" already reads "MyScribe", and
+"Scribe" alone is 85.7 against it, so the transcript read "MyMyScribe"
+(TASK-103). Only a fuzzy correction over more words beats a claim, and only
+if its last word - the one past the claim - is spelled as the rest of the
+term (`PAST_CLAIM_FLOOR`). A phonetic one never does: with "Marie" and
+"Maria" listed, "Marie a" sounds like "Maria" and "a" is all of the rest, so
+"We sent Marie a card" would read "Maria card". And it must extend the
+claimed term, not respell its end: "Sophie a" is a fuzzy match for a listed
+"Sophia". Extending is judged without accents and against the variant that
+matched too: "Jose" past a listed "José Mourinho", "Mai" past a variant
+"Mai Scribe" of "MyScribe". "Marieke
+Vermulen" still becomes "Marieke Vermeulen" past an exact "Marieke"
+("vermulen" against "vermeulen", 94.1), and "Git Hub" "GitHub" past an exact
+"Git" (100). With "Peter" and "Peters" listed, "Peter is" leaves "s" for
+"is" (66.7), so "Peter is ziek" stays as it is. "Dirk is" with "Dirks"
+likewise. Not a correction over the same
+words, so with "Jansen" and "Janssen" both listed neither is respelled as
+the other.
+
+Not decided by any of this: a name followed by a word that completes a
+longer listed name. "Niels en" is 93.3 against "Nielsen", and "en" is
+exactly the leftover, so with "Nielsen" listed it is joined - as it always
+was; "Henk en" with "Henken" likewise. The text is the same as a split
+"Niels en"; only the audio knows. With "Niels" listed as well, the claim
+does not stop it, and "een", "den" and "men" pass too (80 against "en"):
+"Henk een boek" reads "Henken boek", as it did before.
+
+Known and accepted: the edge test refuses some splits the layer joined
+before TASK-110. In a sweep of 21,425 sound-alike splits (2026-10-12), 111
+sentences from 23 split patterns are left exactly as Whisper wrote them:
+"Voo goon" (Vogon), "Da fenter" (Deventer), "Outl uk" (Outlook). Nothing is
+deleted or doubled in those; the text is only not corrected. The vowel rule
+cannot tell "Ze interklaas" from "zo anders", so a one-letter piece written
+with a vowel stays next to the corrected rest: "Ze Sinterklaas", 164 of 2,512
+such probes. No word is lost there either. A variant the user lists is taken
+at its word: with "Sophie Anne" listed as a variant of "Sophia", "Sophie Ann
+zei" reads "Sophia zei".
+And a plural of a term ("mariekes" against "Marieke", 93.3) is corrected.
+A glossary is a statement that this spelling is wanted; the layer is
+visible in the transcript and reversible in one DELETE.
 
 ### Where a multi-word correction lands
 
@@ -90,6 +147,7 @@ import math
 import re
 import sqlite3
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -120,6 +178,28 @@ PHONETIC_FLOOR = 70.0
 # "why cast" and "Marieke Vermeulen"; more would mostly buy false positives,
 # because a longer window has more ways to score well by accident.
 MAX_WINDOW_WORDS = 3
+
+# How much a multi-word window's edge word must resemble the piece of the term
+# left over for it, as `fuzz.ratio` (a word that sounds the same passes too,
+# unless it has a vowel and the leftover has none; see `_edge_word`).
+# Measured on 815 split windows and 786 windows of a term next to a short
+# word (2026-10-11): the lowest split covered by spelling is
+# "Mi Scribe" ("mi" against "my", 50); 785 of the 786 neighbours have nothing
+# left over at one end. 40 would add "Mi Zcribe" and "Voo goon" and lose 12
+# words in "Jan en de Vries"-shaped sentences; 60 loses 8 real splits.
+EDGE_WORD_FLOOR = 50.0
+
+# How well the last word of a correction must be spelled as its piece of the
+# term (`fuzz.ratio`) for the correction to reach past a term already spelled
+# right. Measured (2026-10-12) on 1,320 sentences of a first name with a
+# patronymic or a "-sen" name next to it (30 pairs, 11 short words) and 212
+# split terms past a listed first half: "is" leaves 66.7 against the "s" of
+# "Peters" and is refused at any floor above it. 80 joins 152 of the 212 and
+# 75 no more; 85 drops 20 ("Java Skript" 83.3, "Jan de Fries" 80). Kept at
+# 80 because a missed join leaves Whisper's text and a wrong one deletes a
+# word. What 80 still lets through:
+# "een", "den" and "men" are 80 against the "en" of "Henken" (see below).
+PAST_CLAIM_FLOOR = 80.0
 
 RULE_FUZZY = "fuzzy"
 RULE_PHONETIC = "phonetic"
@@ -418,7 +498,10 @@ def corrections_for(
     processor = utils.default_process
     needles = [needle for needle, _canonical in lookups]
 
-    # start index -> the matches that begin there, best first.
+    # start index -> the matches that begin there, as (plain, length, wratio,
+    # replacement, rule, last, needle); replacement None = already right, last
+    # = how well a multi-word window's last word is spelled as its piece of
+    # the term, needle = the spelling or variant it matched.
     candidates: dict[int, list[tuple]] = {}
     for block in range(0, len(windows), _MATCH_BLOCK):
         chunk = windows[block : block + _MATCH_BLOCK]
@@ -441,13 +524,20 @@ def corrections_for(
                 rule = _rule(plain, core, needle, fuzzy_threshold, phonetic_floor)
                 if rule is None:
                     continue
+                last = 100.0
+                if length > 1:
+                    last = _covers(rows[start : start + length], needle)
+                    if last is None:
+                        continue  # holds the term next to a word, is not the term
                 replacement = _replacement(rows[start : start + length], canonical)
                 if replacement == "".join(
                     str(w.get("text") or "") for w in rows[start : start + length]
                 ):
-                    continue  # already spelled the way the glossary wants it
+                    # Already spelled the way the glossary wants it: nothing to
+                    # write, but the words are claimed (TASK-103).
+                    replacement = None
                 candidates.setdefault(start, []).append(
-                    (plain, length, float(wratio), replacement, rule)
+                    (plain, length, float(wratio), replacement, rule, last, needle)
                 )
 
     out: list[Correction] = []
@@ -457,9 +547,41 @@ def corrections_for(
         if not here:
             index += 1
             continue
+        # A window already spelled right claims its words: only a fuzzy
+        # correction reaching past it may win here, and only if the word past
+        # the claim is spelled as the rest of the term ("Marieke" -> "Marieke
+        # Vermeulen", "Git" -> "GitHub"). "Peter is" against a listed
+        # "Peters" leaves "s" for "is" (66.7) and would respell "Peter" and
+        # drop "is". And it must extend the claimed term, not respell its end:
+        # "Sophie a" is a fuzzy match for a listed "Sophia", and would name
+        # the other person and drop "a". Not one over the same words -
+        # "Janssen" is 92.3 against a listed "Jansen", and both are wanted.
+        claimed = max((c[1] for c in here if c[3] is None), default=0)
+        kept = _bare(
+            "".join(str(w.get("text") or "") for w in rows[index : index + claimed])
+        )
+        fixes = [
+            c
+            for c in here
+            if c[3] is not None
+            and c[1] > claimed
+            and (
+                not claimed
+                or (
+                    c[4] == RULE_FUZZY
+                    and c[5] >= PAST_CLAIM_FLOOR
+                    and (_bare(c[3]).startswith(kept) or _bare(c[6]).startswith(kept))
+                )
+            )
+        ]
+        if not fixes:
+            index += claimed
+            continue
         # Best score wins; a tie goes to the longer window, because a term that
         # scores the same over two words as over one was split, not shortened.
-        _plain, length, wratio, replacement, rule = max(here, key=lambda c: (c[0], c[1]))
+        _plain, length, wratio, replacement, rule, _last, _needle = max(
+            fixes, key=lambda c: (c[0], c[1])
+        )
         confidence = wratio / 100.0
         for offset in range(length):
             word = rows[index + offset]
@@ -539,10 +661,10 @@ TASK-102.04: the outside macOS walk of 0.8.0 got "MiScribe" back with an empty
 glossary. Robert chose a correction and no hotword, so a recording that never
 says the name is not steered towards it. Exact and case-sensitive rather than
 a `Term` through the fuzzy rules: measured here, `corrections_for` with
-"MyScribe" also turns a plain "scribe" or "Scribe" into the name and makes
-"My Scribe" into "My MyScribe" - fine for a name somebody chose to add, not
-for one nobody did. Lowercase two-word forms ("my scribe") are left alone:
-in a sentence they are far more often two words than the name.
+"MyScribe" also turns a plain "scribe" or "Scribe" into the name - fine for
+a name somebody chose to add, not for one nobody did. Lowercase two-word
+forms ("my scribe") are left alone: in a sentence they are far more often two
+words than the name.
 """
 
 
@@ -601,6 +723,80 @@ def with_built_ins(corrections: Sequence[Correction], words: Sequence[dict]) -> 
 def _core(text: str) -> str:
     """A window's text as it is compared: no surrounding space or punctuation."""
     return text.strip().strip("\"'“”‘’.,;:!?…()[]{}«»-–—")
+
+
+def _covers(span: Sequence[dict], needle: str) -> float | None:
+    """Whether each edge word of a multi-word window is a piece of ``needle``:
+    None if one is not, else how well the last word is spelled as its piece
+    (`fuzz.ratio`), which `PAST_CLAIM_FLOOR` reads.
+
+    For the last word, the rest of the window is the start of the term: cut
+    the term where that start matches best, and what is left after the cut
+    has to be the word. For the first word the rest is the end of the term,
+    and the leftover is before the cut. "Linked In" cuts "linkedin" after
+    "linked" and leaves "in" (100); "in Amsterdam" leaves nothing for "in",
+    which is next to the term rather than part of it. Anchored rather than
+    searched: "in" first occurs at "l-IN-kedin", and aligned there it left
+    "l" for "Linked".
+    """
+    from rapidfuzz import fuzz, utils
+
+    texts = [str(w.get("text") or "") for w in span]
+    target = utils.default_process(needle)
+    cuts = range(len(target) + 1)
+
+    def processed(parts: Sequence[str]) -> str:
+        return utils.default_process(_core("".join(parts)))
+
+    # A tie goes to the cut that leaves the edge word more of the term: "Jen"
+    # matches "jan" and "jansen" equally (66.7), and "sen" is the second word.
+    head = processed(texts[:-1])
+    cut = max(cuts, key=lambda k: (fuzz.ratio(head, target[:k]), -k))
+    leftover, last = target[cut:].strip(), processed(texts[-1:])
+    if not _edge_word(leftover, last):
+        return None
+    tail = processed(texts[1:])
+    cut = max(cuts, key=lambda k: (fuzz.ratio(tail, target[k:]), k))
+    if not _edge_word(target[:cut], processed(texts[:1])):
+        return None
+    return float(fuzz.ratio(leftover, last))
+
+
+def _edge_word(leftover: str, word: str) -> bool:
+    """Whether ``word`` is the piece of the term that ``leftover`` is: spelled
+    close enough (`EDGE_WORD_FLOOR`), or sounding the same - "Mai" for the
+    "my" of "MyScribe" is 40 on spelling and 'M' on both metaphones. Not a
+    word with a vowel for a leftover without one: metaphone drops non-initial
+    vowels, so "zo" sounds like the "s" of "Sanders". An empty leftover never
+    is: ratio("", "") is 100."""
+    from rapidfuzz import fuzz
+
+    leftover = leftover.strip()
+    if not leftover:
+        return False
+    if fuzz.ratio(leftover, word) >= EDGE_WORD_FLOOR:
+        return True
+    if _has_vowel(word) and not _has_vowel(leftover):
+        return False
+    sound = _metaphone(leftover)
+    return bool(sound) and sound == _metaphone(word)
+
+
+def _bare(text: str) -> str:
+    """``text`` lowercased, accents set aside ("José" is "jose"), and
+    everything but letters and digits dropped."""
+    from rapidfuzz import utils
+
+    plain = "".join(
+        ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch)
+    )
+    return utils.default_process(plain).replace(" ", "")
+
+
+def _has_vowel(text: str) -> bool:
+    """Accents count: "zó" has a vowel."""
+    bare = unicodedata.normalize("NFD", text)
+    return any(ch in "aeiouy" for ch in bare)
 
 
 def _replacement(span: Sequence[dict], canonical: str) -> str:
