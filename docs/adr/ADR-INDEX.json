@@ -1661,9 +1661,9 @@
       "title": "MyScribe keeps uv-managed Python and retries a failed minor version link instead of shipping its own Python",
       "path": "ADR-027-myscribe-keeps-uv-managed-python-and-retries-a-failed-minor-version-link-instead-of-shipping-its-own-python.md",
       "format": "madr",
-      "status": "Proposed",
+      "status": "Accepted",
       "date": "2026-10-19",
-      "decision_summary": "Not decided; Robert decides.",
+      "decision_summary": "Chosen option: A, decided by Robert on 2026-10-19.",
       "topics": [
         "first-run",
         "packaging",

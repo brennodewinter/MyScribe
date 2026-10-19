@@ -1,7 +1,7 @@
 ---
 id: "ADR-027"
 title: "MyScribe keeps uv-managed Python and retries a failed minor version link instead of shipping its own Python"
-status: "Proposed"
+status: "Accepted"
 date: "2026-10-19"
 binding: false
 gate: null
@@ -9,7 +9,6 @@ documents_shipped: false
 verified_in: []
 supersedes: []
 superseded_by: null
-format: "madr"
 topics:
   - "packaging"
   - "windows"
@@ -26,6 +25,7 @@ symbols:
   - "sync"
   - "sync_command"
 context_scope: "selective"
+format: "madr"
 ---
 
 <!-- markdownlint-disable MD025 -->
@@ -34,7 +34,7 @@ context_scope: "selective"
 
 ## Status
 
-Proposed, 2026-10-19.
+Accepted, 2026-10-19.
 
 ## Status History
 
@@ -45,6 +45,11 @@ status_history:
     changed_by: Claude (agent, session 2026-10-19)
     reason: Initial proposal
     changed_via: adr-kit
+  - date: 2026-10-19
+    status: Accepted
+    changed_by: "User: Robert van den Breemen"
+    reason: Robert chose option A, 2026-10-19
+    changed_via: adr-kit lifecycle
 ```
 
 ## Context and Problem Statement
@@ -109,7 +114,7 @@ The question is how the first start should survive this failure.
 
 ## Decision Outcome
 
-Not decided; Robert decides. Recommended: **A**. It is a few lines in
+Chosen option: **A**, decided by Robert on 2026-10-19. It is a few lines in
 `sync`, adds nothing to pin, and the simulation shows it works for every
 failure on that step that leaves the interpreter in place. B stays the
 fallback, if the reporter still fails after A.
@@ -184,7 +189,7 @@ For the recommended option.
 
 ## Open Questions
 
-- [ ] Which option: A, B or C?
+- [x] Which option: A, B or C? — **Answered 2026-10-19 by User: Robert van den Breemen:** A: retry the sync once with --python naming the installed interpreter; B stays the fallback in TASK-113.03.
 
 ## Related Decisions
 
