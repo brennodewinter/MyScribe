@@ -32,4 +32,4 @@ One row per Architecture Decision Record. Scope is the Enforcement `path_glob` s
 | ADR-024 | Accepted | - | Chosen option: A, decided by Robert on 2026-09-28 with A and B in front of him ("trust my network"), together with an... |
 | ADR-025 | Proposed | - | Not decided; Robert decides. |
 | ADR-026 | Accepted | - | Chosen option: A, decided by Robert on 2026-10-19, with a systemd user unit on Linux and the XDG autostart file as fa... |
-| ADR-027 | Proposed | - | Not decided; Robert decides. |
+| ADR-027 | Accepted | - | Chosen option: A, decided by Robert on 2026-10-19. |
