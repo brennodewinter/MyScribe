@@ -1,7 +1,7 @@
 ---
 id: "ADR-026"
 title: "MyScribe runs in the background as a per-user login item started headless, not as an operating-system service"
-status: "Proposed"
+status: "Accepted"
 date: "2026-10-19"
 binding: false
 gate: null
@@ -9,7 +9,6 @@ documents_shipped: false
 verified_in: []
 supersedes: []
 superseded_by: null
-format: "madr"
 topics:
   - "autostart"
   - "packaging"
@@ -27,6 +26,7 @@ symbols:
   - "start_command"
   - "run_headless"
 context_scope: "selective"
+format: "madr"
 ---
 
 <!-- markdownlint-disable MD025 -->
@@ -35,7 +35,7 @@ context_scope: "selective"
 
 ## Status
 
-Proposed, 2026-10-19.
+Accepted, 2026-10-19.
 
 ## Status History
 
@@ -46,6 +46,11 @@ status_history:
     changed_by: Claude (agent, session 2026-10-19)
     reason: Initial proposal
     changed_via: adr-kit
+  - date: 2026-10-19
+    status: Accepted
+    changed_by: "User: Robert van den Breemen"
+    reason: Robert chose option A with a systemd user unit on Linux, 2026-10-19
+    changed_via: adr-kit lifecycle
 ```
 
 ## Context and Problem Statement
@@ -109,10 +114,11 @@ icon shows it. They depend on this decision, not the other way round.
 
 ## Decision Outcome
 
-Not decided; Robert decides. Recommended: **A**, because it is the only
-option that needs no administrator rights and no new dependency, starts in
-the user's own session with the user's own library, and builds on the
-mechanism TASK-089.21 already ships and tests.
+Chosen option: **A**, decided by Robert on 2026-10-19, with a systemd user
+unit on Linux and the XDG autostart file as fallback. A is the only option
+that needs no administrator rights and no new dependency, starts in the
+user's own session with the user's own library, and builds on the mechanism
+TASK-089.21 already ships and tests.
 
 ### Confirmation
 
@@ -206,8 +212,8 @@ For the recommended option.
 
 ## Open Questions
 
-- [ ] Which option: A, B, C or D?
-- [ ] On Linux, a systemd user unit with the XDG autostart file as fallback, or the XDG file alone as today?
+- [x] Which option: A, B, C or D? — **Answered 2026-10-19 by User: Robert van den Breemen:** A: a per-user login item started headless.
+- [x] On Linux, a systemd user unit with the XDG autostart file as fallback, or the XDG file alone as today? — **Answered 2026-10-19 by User: Robert van den Breemen:** A systemd user unit where a systemd user session runs, with the XDG autostart file as fallback.
 
 ## Related Decisions
 
@@ -226,4 +232,4 @@ For the recommended option.
 * Apple, SMAppService: <https://developer.apple.com/documentation/servicemanagement/smappservice>
 * systemd, loginctl and user units: <https://www.freedesktop.org/software/systemd/man/latest/loginctl.html>
 
-Enforcement: none yet; the rules depend on the option chosen.
+Enforcement: none machine-checkable; the `scribe/autostart.py` tests of TASK-112.01 assert the `--headless` rule.
