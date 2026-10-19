@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+### Fixed
+
+- **A first start on Windows no longer stops when uv cannot make its Python
+  folder link.** uv downloads Python and then makes a junction beside it;
+  where Windows refuses that (`os error 448`, GitHub issue #16) the install
+  stopped. The launcher now syncs once more with the Python uv already
+  downloaded, and says so (TASK-113.01, ADR-027).
+
 ## [0.8.6] - 2026-10-19
 
 ### Fixed

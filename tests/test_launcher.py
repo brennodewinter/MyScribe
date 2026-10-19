@@ -224,6 +224,114 @@ def test_a_failed_sync_names_the_proxy_the_child_was_given(layout, tmp_path, mon
     )
 
 
+# What uv 0.12.13 printed on the machine of GitHub issue 16.
+MINOR_LINK_FAILURE = [
+    "Downloading cpython-3.12.14-windows-x86_64-none (download) (21.0MiB)",
+    " Downloaded cpython-3.12.14-windows-x86_64-none (download)",
+    "error: Failed to create Python minor version link directory",
+    "  Caused by: The path cannot be traversed because it contains an untrusted mount point. (os error 448)",
+]
+
+
+def _flaky_uv(tmp_path, first: list[str], then: int = 0) -> tuple[list[str], Path]:
+    """A uv that prints `first` and exits 2 on its first run, and exits `then`
+    on every run after it. Each run's arguments are one JSON line in the log."""
+    log = tmp_path / "uv_runs.jsonl"
+    script = tmp_path / "flaky_uv.py"
+    script.write_text(textwrap.dedent(f"""
+        import json, sys
+        log = {str(log)!r}
+        try:
+            runs = sum(1 for _ in open(log, encoding="utf-8"))
+        except FileNotFoundError:
+            runs = 0
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sys.argv[1:]) + "\\n")
+        if runs == 0:
+            print("\\n".join({first!r}))
+            raise SystemExit(2)
+        raise SystemExit({then})
+    """))
+    return [sys.executable, str(script)], log
+
+
+def _runs(log: Path) -> list[list[str]]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+def _downloaded_python(layout, name: str = "cpython-3.12.14-windows-x86_64-none") -> Path:
+    """The interpreter uv leaves behind when only its link step failed."""
+    home = layout.python_dir / name
+    executable = home / "python.exe" if layout.windows else home / "bin" / "python3"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("", encoding="utf-8")
+    return executable
+
+
+def test_a_sync_that_fails_only_on_the_minor_version_link_is_retried_with_the_downloaded_python(
+        layout, tmp_path, monkeypatch):
+    """GitHub issue 16: uv stopped after the download, on the junction it makes
+    beside it. The interpreter is complete by then, and a sync that names it
+    gets through (measured with uv 0.12.13 on 2026-10-19, ADR-027)."""
+    command, log = _flaky_uv(tmp_path, MINOR_LINK_FAILURE)
+    monkeypatch.setattr(launcher, "uv_command", lambda _layout: command)
+    launcher.prepare_home(layout)
+    _downloaded_python(layout, "cpython-3.12.9-windows-x86_64-none")
+    newest = _downloaded_python(layout)
+    _downloaded_python(layout, "cpython-3.12-windows-x86_64-none")  # a link left behind
+    lines: list[str] = []
+
+    assert launcher.sync(layout, lines.append) is True
+    runs = _runs(log)
+    assert len(runs) == 2
+    assert "--python" not in runs[0]
+    assert runs[1][runs[1].index("--python") + 1] == str(newest)
+    assert runs[1][:len(runs[0])] == runs[0]
+    assert any("trying once more" in line for line in lines)
+    _fake_env_python(layout)
+    assert launcher.needs_sync(layout) is False
+
+
+def test_any_other_sync_failure_is_not_retried(layout, tmp_path, monkeypatch):
+    _no_proxy_configured(monkeypatch)
+    command, log = _flaky_uv(tmp_path, ["error: Failed to fetch: `https://pypi.org/simple/torch/`"])
+    monkeypatch.setattr(launcher, "uv_command", lambda _layout: command)
+    launcher.prepare_home(layout)
+    _downloaded_python(layout)
+    lines: list[str] = []
+
+    assert launcher.sync(layout, lines.append) is False
+    assert len(_runs(log)) == 1
+    assert lines[-1] == "uv sync failed with exit code 2"
+
+
+def test_the_link_failure_is_not_retried_without_a_downloaded_python(layout, tmp_path, monkeypatch):
+    """Nothing to name with --python: a retry would only download again."""
+    _no_proxy_configured(monkeypatch)
+    command, log = _flaky_uv(tmp_path, MINOR_LINK_FAILURE)
+    monkeypatch.setattr(launcher, "uv_command", lambda _layout: command)
+    launcher.prepare_home(layout)
+    lines: list[str] = []
+
+    assert launcher.sync(layout, lines.append) is False
+    assert len(_runs(log)) == 1
+
+
+def test_a_retry_that_fails_too_is_reported_once_and_not_repeated(layout, tmp_path, monkeypatch):
+    _no_proxy_configured(monkeypatch)
+    command, log = _flaky_uv(tmp_path, MINOR_LINK_FAILURE, then=2)
+    monkeypatch.setattr(launcher, "uv_command", lambda _layout: command)
+    launcher.prepare_home(layout)
+    _downloaded_python(layout)
+    lines: list[str] = []
+
+    assert launcher.sync(layout, lines.append) is False
+    assert len(_runs(log)) == 2
+    assert lines[-1] == "uv sync failed with exit code 2"
+    assert sum(line.startswith("uv sync failed") for line in lines) == 1
+    assert not layout.stamp_file.exists()
+
+
 # --- the child environment --------------------------------------------------------
 
 
