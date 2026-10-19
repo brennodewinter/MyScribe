@@ -1,5 +1,26 @@
 ## [Unreleased]
 
+## [0.8.6] - 2026-10-19
+
+### Fixed
+
+- **A glossary correction no longer deletes the word next to a term.**
+  "Ik woon in Amsterdam" kept its "in", and "My Scribe" with the term
+  MyScribe becomes one MyScribe instead of "My MyScribe". A word already
+  spelled the way the glossary wants is left alone, so "MyMyScribe" and
+  "NotebookLMLM" no longer appear (TASK-103, TASK-110).
+- **AI answers are written in the transcript's language.** Every prompt now
+  names it, so a model that summarised a Dutch recording in English answers
+  in Dutch. A translation is still answered in English (TASK-105.01).
+- **Action items and minutes see who speaks**, with the names shown on the
+  page, so they can name an owner. Notes of a long recording keep each
+  line's speaker (TASK-105.03).
+- Changing a prompt's instructions now always asks the question anew instead
+  of reusing an answer to the old one (TASK-105.02).
+- **Watch folders say when they are stopped.** With `--no-supervisor` the
+  Watch folders card shows a warning, and `--help` says that watch folders
+  and feeds stop with the supervisor (TASK-107.07).
+
 ## [0.8.5] - 2026-10-06
 
 ### Fixed
