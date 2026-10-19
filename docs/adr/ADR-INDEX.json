@@ -1655,6 +1655,62 @@
         "supersedes": [],
         "superseded_by": null
       }
+    },
+    {
+      "id": "ADR-027",
+      "title": "MyScribe keeps uv-managed Python and retries a failed minor version link instead of shipping its own Python",
+      "path": "ADR-027-myscribe-keeps-uv-managed-python-and-retries-a-failed-minor-version-link-instead-of-shipping-its-own-python.md",
+      "format": "madr",
+      "status": "Proposed",
+      "date": "2026-10-19",
+      "decision_summary": "Not decided; Robert decides.",
+      "topics": [
+        "first-run",
+        "packaging",
+        "windows"
+      ],
+      "aliases": [
+        "bundled python",
+        "minor version link",
+        "os error 448",
+        "untrusted mount point",
+        "uv python junction"
+      ],
+      "components": [
+        "packaging/launcher/myscribe_launcher.py"
+      ],
+      "symbols": [
+        "sync",
+        "sync_command"
+      ],
+      "context_scope": "selective",
+      "decision_contract": {
+        "must": [
+          "Retry only when the uv output holds Failed to create Python minor version link directory, and only once.",
+          "The retry names the installed interpreter with --python; it never falls back to a system Python."
+        ],
+        "must_not": [
+          "Retry any other sync failure.",
+          "Turn on a Python from PATH (--python-preference only-managed stays)."
+        ],
+        "exceptions": [
+          "None."
+        ],
+        "verification": [
+          "The TASK-113.01 tests and the simulation transcript in its notes."
+        ]
+      },
+      "scope": {
+        "path_globs": []
+      },
+      "metadata": {
+        "binding": false,
+        "gate": null,
+        "documents_shipped": false,
+        "verified_in": [],
+        "supersedes": [],
+        "superseded_by": null
+      }
     }
   ],
   "relationships": [
@@ -2189,6 +2245,18 @@
     {
       "source": "ADR-026",
       "target": "ADR-019",
+      "type": "related",
+      "resolved": true
+    },
+    {
+      "source": "ADR-027",
+      "target": "ADR-011",
+      "type": "related",
+      "resolved": true
+    },
+    {
+      "source": "ADR-027",
+      "target": "ADR-012",
       "type": "related",
       "resolved": true
     }
