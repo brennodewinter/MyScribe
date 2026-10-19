@@ -1594,6 +1594,67 @@
         "supersedes": [],
         "superseded_by": null
       }
+    },
+    {
+      "id": "ADR-026",
+      "title": "MyScribe runs in the background as a per-user login item started headless, not as an operating-system service",
+      "path": "ADR-026-myscribe-runs-in-the-background-as-a-per-user-login-item-started-headless-not-as-an-operating-system-service.md",
+      "format": "madr",
+      "status": "Proposed",
+      "date": "2026-10-19",
+      "decision_summary": "Not decided; Robert decides.",
+      "topics": [
+        "autostart",
+        "background",
+        "packaging"
+      ],
+      "aliases": [
+        "background server",
+        "headless start",
+        "login item",
+        "run as a service",
+        "start at login"
+      ],
+      "components": [
+        "packaging/launcher/myscribe_launcher.py",
+        "scribe.autostart"
+      ],
+      "symbols": [
+        "run_headless",
+        "start_command"
+      ],
+      "context_scope": "selective",
+      "decision_contract": {
+        "must": [
+          "Every login item starts the launcher with --headless, so no window and no console appear.",
+          "Register per user only: no administrator rights, no machine-wide key, folder or unit.",
+          "A login item written by an earlier version is rewritten to the current command at the next start.",
+          "On Linux, an XDGDATAHOME the user has set is written into the unit, so the background server opens the same library as a start by hand."
+        ],
+        "must_not": [
+          "Install or require an operating-system service, daemon or system unit.",
+          "Point a login item at the environment's python instead of the launcher, so that a start after an update still re-syncs (TASK-089.21 criterion 4).",
+          "Register a macOS path under AppTranslocation, which is gone at the next login."
+        ],
+        "exceptions": [
+          "None."
+        ],
+        "verification": [
+          "scribe/autostart.py tests assert the registered command carries --headless on each OS.",
+          "The login walk under Confirmation."
+        ]
+      },
+      "scope": {
+        "path_globs": []
+      },
+      "metadata": {
+        "binding": false,
+        "gate": null,
+        "documents_shipped": false,
+        "verified_in": [],
+        "supersedes": [],
+        "superseded_by": null
+      }
     }
   ],
   "relationships": [
@@ -2110,6 +2171,24 @@
     {
       "source": "ADR-025",
       "target": "ADR-022",
+      "type": "related",
+      "resolved": true
+    },
+    {
+      "source": "ADR-026",
+      "target": "ADR-001",
+      "type": "related",
+      "resolved": true
+    },
+    {
+      "source": "ADR-026",
+      "target": "ADR-011",
+      "type": "related",
+      "resolved": true
+    },
+    {
+      "source": "ADR-026",
+      "target": "ADR-019",
       "type": "related",
       "resolved": true
     }
