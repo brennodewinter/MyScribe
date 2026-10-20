@@ -2527,7 +2527,7 @@ class _RecordingMechanism:
         self.value = None
 
 
-AT_LOGIN = (r"C:\Program Files\MyScribe\MyScribe.exe", "--at-login", "--no-browser")
+AT_LOGIN = (r"C:\Program Files\MyScribe\MyScribe.exe", "--at-login", "--no-browser", "--headless")
 
 
 @pytest.fixture(autouse=True)

@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+### Changed
+
+- **Started at login, MyScribe runs without a window.** The login entry now
+  starts the launcher with `--headless`, so there is no window to keep open;
+  open MyScribe from its shortcut or at `http://localhost:4242`. An entry an
+  earlier version wrote is brought up to date at the next start, and one you
+  switched off stays off (TASK-112.01, ADR-026).
+
 ### Fixed
 
 - **A first start on Windows no longer stops when uv cannot make its Python

@@ -108,7 +108,7 @@ def _the_neighbour_is_still_there(mechanism) -> bool:
     return (mechanism.folder / NEIGHBOUR).exists()
 
 
-COMMAND = ("C:\\Program Files\\MyScribe\\MyScribe.exe", "--at-login", "--no-browser")
+COMMAND = ("C:\\Program Files\\MyScribe\\MyScribe.exe", "--at-login", "--no-browser", "--headless")
 
 
 # --- the state comes from the OS, never from a row ---------------------------------
@@ -204,7 +204,7 @@ def test_what_each_mechanism_actually_leaves_on_disk(tmp_path):
     # The whole line, not "starts with Exec=": this string is what a desktop
     # actually runs, and it is the only evidence about Linux there can be
     # here. A path with a space in it is the case that breaks a naive join.
-    assert r'Exec="C:\\Program Files\\MyScribe\\MyScribe.exe" --at-login --no-browser' in desktop
+    assert r'Exec="C:\\Program Files\\MyScribe\\MyScribe.exe" --at-login --no-browser --headless' in desktop
 
 
 def test_the_desktop_entry_quotes_the_way_the_spec_says(tmp_path):
@@ -346,7 +346,7 @@ def test_a_release_registers_the_launcher_and_a_clone_the_start_script(tmp_path)
         environ={autostart.LAUNCHER_VARIABLE: r"C:\Program Files\MyScribe\MyScribe.exe"},
         platform="win32",
     )
-    assert release == (r"C:\Program Files\MyScribe\MyScribe.exe", "--at-login", "--no-browser")
+    assert release == (r"C:\Program Files\MyScribe\MyScribe.exe", "--at-login", "--no-browser", "--headless")
 
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -390,13 +390,124 @@ def test_a_mac_release_names_something_launchd_can_actually_execute():
     assert mac is not None
     assert not mac[0].endswith(".app"), "argv[0] goes to execvp; a bundle directory is not executable"
     assert mac[:4] == ("/usr/bin/open", "-a", bundle, "--args")
-    assert mac[4:] == ("--at-login", "--no-browser")
+    assert mac[4:] == ("--at-login", "--no-browser", "--headless")
 
     # The other two doors name their launcher directly: both are files.
     for platform, launcher in (("win32", r"C:\Program Files\MyScribe\MyScribe.exe"), ("linux", "/opt/MyScribe.AppImage")):
         assert autostart.start_command(environ={autostart.LAUNCHER_VARIABLE: launcher}, platform=platform) == (
-            launcher, "--at-login", "--no-browser",
+            launcher, "--at-login", "--no-browser", "--headless",
         )
+
+
+def test_a_login_starts_the_launcher_headless_on_every_os():
+    """TASK-112.01 AC #1, ADR-026's Must: no window and no console at login.
+    The launcher's own `--headless` door; without it the Tk window opens
+    and has to be kept open."""
+    for platform, launcher in (("win32", r"C:\Program Files\MyScribe\MyScribe.exe"),
+                               ("darwin", "/Applications/MyScribe.app"),
+                               ("linux", "/opt/MyScribe.AppImage")):
+        command = autostart.start_command(environ={autostart.LAUNCHER_VARIABLE: launcher}, platform=platform)
+        assert command is not None and "--headless" in command, platform
+
+
+# --- an entry an older version wrote ----------------------------------------------
+
+
+OLD = ("C:\\Program Files\\MyScribe\\MyScribe.exe", "--at-login", "--no-browser")
+RELEASE = {autostart.LAUNCHER_VARIABLE: "C:\\Program Files\\MyScribe\\MyScribe.exe"}
+
+
+class _CountingXdg(autostart.XdgAutostart):
+    """A real desktop-entry mechanism that counts its writes."""
+
+    def __init__(self, folder):
+        super().__init__(folder=folder)
+        self.writes = 0
+
+    def write(self, command) -> None:
+        self.writes += 1
+        super().write(command)
+
+
+def test_an_entry_an_older_version_wrote_is_rewritten_to_the_current_command(tmp_path):
+    """AC #2: 0.8.6 and earlier registered no `--headless`, so their login
+    opened the window. The next start brings the entry up to date."""
+    mechanism = _CountingXdg(tmp_path / "autostart")
+    mechanism.write(OLD)
+
+    entry = autostart.refresh(mechanism, command=COMMAND, environ=RELEASE)
+
+    assert entry is not None and entry.on is True
+    assert mechanism.read() == mechanism.render(COMMAND)
+    assert mechanism.writes == 2
+
+
+def test_each_mechanism_rewrites_an_older_entry_and_keeps_its_neighbour(mechanism):
+    """The same rewrite against the real Run key (a scratch one), the plist
+    and the desktop file: each quotes the launcher path its own way, and the
+    match on "names this launcher" has to survive all three."""
+    mechanism.write(OLD)
+    _put_a_neighbour(mechanism)
+
+    entry = autostart.refresh(mechanism, command=COMMAND, environ=RELEASE)
+
+    assert entry is not None
+    assert mechanism.read() == mechanism.render(COMMAND)
+    assert _the_neighbour_is_still_there(mechanism)
+
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="no registry on this platform")
+def test_on_windows_the_launcher_path_matches_in_any_case():
+    """Windows paths are case-insensitive, and the installer and
+    `sys.executable` need not agree on the case of `programs`."""
+    _drop_scratch_key()
+    try:
+        mechanism = autostart.WindowsRun(key=SCRATCH_KEY)
+        mechanism.write((r"C:\program files\myscribe\MyScribe.exe", "--at-login", "--no-browser"))
+
+        assert autostart.refresh(mechanism, command=COMMAND, environ=RELEASE) is not None
+        assert mechanism.read() == mechanism.render(COMMAND)
+    finally:
+        _drop_scratch_key()
+
+def test_an_entry_that_is_switched_off_stays_off(tmp_path):
+    """AC #2's other half: off is a missing entry, or the desktop's own
+    `Hidden=true`. Neither is written back."""
+    missing = _CountingXdg(tmp_path / "missing")
+    assert autostart.refresh(missing, command=COMMAND, environ=RELEASE) is None
+    assert missing.writes == 0 and not missing.path.exists()
+
+    hidden = _CountingXdg(tmp_path / "hidden")
+    hidden.folder.mkdir()
+    hidden.path.write_text(f"[Desktop Entry]\nExec={hidden.render(OLD)}\nHidden=true\n", encoding="utf-8")
+    assert autostart.refresh(hidden, command=COMMAND, environ=RELEASE) is None
+    assert "Hidden=true" in hidden.path.read_text(encoding="utf-8")
+
+
+def test_an_entry_that_is_already_current_is_not_written(tmp_path):
+    mechanism = _CountingXdg(tmp_path / "autostart")
+    mechanism.write(COMMAND)
+
+    autostart.refresh(mechanism, command=COMMAND, environ=RELEASE)
+
+    assert mechanism.writes == 1
+
+
+def test_only_a_launcher_rewrites_and_only_its_own_entry(tmp_path):
+    """A clone on the same machine as a release must not point the release's
+    entry at its start script, and a second install must not take over an
+    entry that names another launcher. Neither is "an older version"."""
+    clone = _CountingXdg(tmp_path / "clone")
+    clone.write(OLD)
+    assert autostart.refresh(clone, command=("/bin/bash", "start.sh"), environ={}) is None
+    assert clone.writes == 1
+
+    other = _CountingXdg(tmp_path / "other")
+    elsewhere = ("D:\\Apps\\MyScribe\\MyScribe.exe", "--at-login", "--no-browser")
+    other.write(elsewhere)
+    assert autostart.refresh(other, command=COMMAND, environ=RELEASE) is None
+    assert other.read() == other.render(elsewhere)
 
 
 def test_where_nothing_is_known_to_start_it_refuses_rather_than_guesses(tmp_path, monkeypatch):
@@ -422,3 +533,35 @@ def test_status_offers_the_command_it_would_register_while_it_is_off(tmp_path):
     assert off.on is False
     assert "--at-login" in off.command
     assert not (tmp_path / "autostart").exists()
+
+
+# --- the start that does the rewriting ---------------------------------------------
+
+
+def test_a_registry_that_will_not_answer_costs_the_rewrite_not_the_start(monkeypatch):
+    """The app calls this from its lifespan; a refusal is a log line."""
+    from scribe import app as app_module
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("access denied")
+
+    logged: list[tuple[str, dict]] = []
+    monkeypatch.setattr(autostart, "refresh", refuse)
+    monkeypatch.setattr(app_module.applog, "log", lambda event, **fields: logged.append((event, fields)))
+
+    app_module._refresh_login_entry()  # must not raise
+
+    assert logged == [("autostart.refresh_failed", {"level": "warn", "error": "access denied"})]
+
+
+def test_a_rewrite_is_logged_with_what_was_written(monkeypatch):
+    from scribe import app as app_module
+
+    entry = autostart.Entry(where=r"HKCU\Run\MyScribe", command="MyScribe.exe --headless", on=True)
+    logged: list[tuple[str, dict]] = []
+    monkeypatch.setattr(autostart, "refresh", lambda *_a, **_k: entry)
+    monkeypatch.setattr(app_module.applog, "log", lambda event, **fields: logged.append((event, fields)))
+
+    app_module._refresh_login_entry()
+
+    assert logged == [("autostart.rewritten", {"where": entry.where, "command": entry.command})]

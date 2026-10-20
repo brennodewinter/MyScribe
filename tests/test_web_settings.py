@@ -929,7 +929,7 @@ class _FakeMechanism:
         self.value = None
 
 
-AT_LOGIN = (r"C:\Program Files\MyScribe\MyScribe.exe", "--at-login", "--no-browser")
+AT_LOGIN = (r"C:\Program Files\MyScribe\MyScribe.exe", "--at-login", "--no-browser", "--headless")
 
 
 def _the_autostart_card(page: str) -> str:
@@ -964,6 +964,15 @@ def test_the_card_prints_the_exact_entry_not_only_that_it_is_on(client, login_en
 
     assert r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run\MyScribe" in card
     assert "MyScribe.exe" in card and "--at-login" in card and "--no-browser" in card
+
+
+def test_the_card_says_a_login_start_has_no_window_and_how_to_open_it(client, login_entry):
+    """TASK-112.01 AC #3: started at login MyScribe runs headless, so the card
+    says where it is then - otherwise "no window" reads as "did not start"."""
+    card = _the_autostart_card(client.get("/settings?section=autostart").text)
+
+    assert "without a window" in card
+    assert "localhost:4242" in card
 
 
 def test_the_switch_registers_and_removes_through_the_module(client, login_entry):

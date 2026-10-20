@@ -50,7 +50,7 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
 import scribe
-from scribe import applog, db, env, fsbrowse, guard, jobs, media, paths, supervisor, web
+from scribe import applog, autostart, db, env, fsbrowse, guard, jobs, media, paths, supervisor, web
 from scribe.ingest import feeds, recording, watching
 from scribe.options import OPTION_FIELDS, PARAM_KEYS, parse_options, replayable
 from scribe.stages import finalize, probe, transcribe, url_stage
@@ -217,6 +217,16 @@ def _event_out(row: sqlite3.Row) -> dict:
     }
 
 
+def _refresh_login_entry() -> None:
+    try:
+        entry = autostart.refresh()
+    except (OSError, ValueError) as refused:
+        applog.log("autostart.refresh_failed", level="warn", error=str(refused))
+        return
+    if entry is not None:
+        applog.log("autostart.rewritten", where=entry.where, command=entry.command)
+
+
 def create_app(
     db_path: str | Path | None = None,
     start_supervisor: bool = True,
@@ -260,6 +270,12 @@ def create_app(
         # finds nothing the second time (TASK-024).
         finalize.sweep_speaker_passes(conn)
         app.state.conn = conn
+        # A login entry an older version wrote starts the launcher with its
+        # window; ADR-026 wants it rewritten at the next start. Not from a
+        # second instance (`--no-supervisor`), and never fatal: a registry
+        # that will not answer costs the rewrite, not the app.
+        if start_supervisor:
+            _refresh_login_entry()
         sup: supervisor.Supervisor | None = None
         if start_supervisor:
             sup = supervisor.Supervisor(db_path or paths.DB_PATH)
