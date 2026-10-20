@@ -2102,7 +2102,7 @@ def test_a_console_start_asks_nothing_says_so_and_is_still_refused_the_sync(
                           "--port", str(_free_port())])
 
     printed = capsys.readouterr().out
-    assert code == 1
+    assert code == 0, "a full volume is a configuration problem, not a crash (TASK-112.02)"
     assert not marker.exists(), "the download was started on a volume that cannot hold it"
     assert "nothing was asked" in printed and "MYSCRIBE_HOME" in printed
     assert "not enough room" in printed and "3.0 GB free" in printed
@@ -2212,9 +2212,10 @@ def test_a_start_at_login_over_a_broken_pointer_says_so_in_a_window(layout, tmp_
     code = launcher.main(["--at-login", "--no-browser", "--payload", str(layout.payload),
                           "--port", str(_free_port())])
 
-    assert code == 1
+    assert code == 0, "an unplugged drive is a configuration problem, not a crash (TASK-112.02)"
     assert len(shown) == 1
     assert "not there" in shown[0] and "cannot start" in shown[0]
+    assert "not there" in (tmp_path / "default-launcher.log").read_text(encoding="utf-8")
 
 
 def test_the_volume_measured_is_the_one_the_doctor_measures(tmp_path, layout):
@@ -2379,7 +2380,8 @@ class _ServingLaunch:
         until = time.monotonic() + deadline
         launch = self
         self.app = types.SimpleNamespace(
-            alive=lambda: launch.stopped_at is None and time.monotonic() < until)
+            alive=lambda: launch.stopped_at is None and time.monotonic() < until,
+            exit_code=lambda: 0)
 
     def report(self, state, text):
         pass
@@ -2476,3 +2478,173 @@ def test_a_browser_that_refuses_is_said_with_the_address(monkeypatch):
     launcher.open_in_browser("http://127.0.0.1:4242/", lambda state, text: said.append((state, text)))
 
     assert said == [("status", launcher.BROWSER_REFUSED.format(url="http://127.0.0.1:4242/"))]
+
+
+# --- TASK-112.02: one exit-code contract ------------------------------------------
+#
+# A supervisor that restarts on a non-zero exit (launchd's KeepAlive with
+# SuccessfulExit false, systemd's Restart=on-failure) reads this contract:
+# a crash asks for a restart, and nothing else does.
+
+
+def _app_child(code: str):
+    """A child in a session of its own, as `AppProcess.start` makes the app.
+
+    Never in pytest's: `AppProcess.stop` sends SIGTERM and then SIGKILL to the
+    child's whole process group, and on POSIX a child that shares the group
+    takes pytest - and on CI the runner - down with it."""
+    return _subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+
+
+def _sleeping_child(seconds: int = 60):
+    return _app_child(f"import time; time.sleep({seconds})")
+
+
+def _launch_over(layout, child, monkeypatch):
+    """A real Launch whose app is `child`, past everything `first_run` does."""
+    layout.logs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(launcher, "first_run", lambda *a, **k: True)
+    launch = launcher.Launch(layout, _free_port(), False, lambda state, text: None)
+    launch.app = launcher.AppProcess(layout, launch.port)
+    launch.app.proc = child
+    return launch
+
+
+def _launcher_log(layout) -> str:
+    return (layout.logs_dir / launcher.INSTALL_LOG).read_text(encoding="utf-8")
+
+
+def test_an_app_that_dies_ends_the_headless_launcher_with_its_own_code(layout, monkeypatch):
+    """The crash the research found: the child dies, and the launcher said 0."""
+    child = _sleeping_child()
+    launch = _launch_over(layout, child, monkeypatch)
+    threading.Timer(0.3, child.kill).start()
+
+    code = launcher.run_headless(launch)
+
+    assert code == launcher.APP_DIED and code != 0
+    said = _launcher_log(layout)
+    assert "stopped unexpectedly" in said and "app.log" in said
+
+
+def test_an_app_that_ends_by_itself_without_an_error_ends_the_launcher_with_zero(layout, monkeypatch):
+    """The other half: a non-zero code only for a crash, or a stop route
+    (TASK-112.03) would be restarted by the mechanism it was meant to end."""
+    child = _app_child("pass")
+    launch = _launch_over(layout, child, monkeypatch)
+
+    assert launcher.run_headless(launch) == 0
+    assert "MyScribe stopped." in _launcher_log(layout)
+
+
+def test_a_sigterm_is_a_clean_stop_and_says_so(layout, monkeypatch):
+    child = _sleeping_child()
+    launch = _launch_over(layout, child, monkeypatch)
+    unhandled = []
+    previous = _signal.signal(_signal.SIGTERM, lambda *a: unhandled.append(a))  # keeps pytest alive
+    try:
+        threading.Timer(0.3, _signal.raise_signal, args=(_signal.SIGTERM,)).start()
+        code = launcher.run_headless(launch)
+    finally:
+        _signal.signal(_signal.SIGTERM, previous)
+        if child.poll() is None:
+            child.kill()
+
+    assert code == 0
+    assert "MyScribe was stopped." in _launcher_log(layout)
+
+
+def _port_busy(layout, monkeypatch, held):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind((launcher.HOST, 0))
+    sock.listen(1)
+    held.append(sock)
+    return sock.getsockname()[1], "is used by another program"
+
+
+def _already_serving(layout, monkeypatch, held):
+    monkeypatch.setattr(launcher, "running_instance", lambda *a, **k: True)
+    return _free_port(), "already running"
+
+
+def _offline_sync(layout, monkeypatch, held):
+    monkeypatch.setattr(launcher, "needs_sync", lambda _layout: True)
+    monkeypatch.setattr(launcher, "enough_disk", lambda *a, **k: True)
+    monkeypatch.setattr(launcher, "install_tools", lambda _layout: None)
+
+    def sync(_layout, line):
+        line("error: Failed to fetch: `https://pypi.org/simple/six/`")
+        return False
+
+    monkeypatch.setattr(launcher, "sync", sync)
+    return _free_port(), "Check the internet connection"
+
+
+@pytest.mark.parametrize("problem", [_port_busy, _already_serving, _offline_sync],
+                         ids=["port-busy", "already-serving", "offline-sync"])
+def test_a_configuration_problem_ends_with_zero_and_is_in_the_log(layout, monkeypatch, problem):
+    """A restart cannot plug a drive in or free a port; under launchd it would
+    retry a multi-GB sync every ten seconds, on battery."""
+    layout.logs_dir.mkdir(parents=True)
+    held: list = []
+    try:
+        port, sentence = problem(layout, monkeypatch, held)
+        launch = launcher.Launch(layout, port, False, lambda state, text: None)
+
+        code = launcher.run_headless(launch)
+    finally:
+        for sock in held:
+            sock.close()
+
+    assert code == 0
+    assert sentence in _launcher_log(layout)
+
+
+def _unplugged(tmp_path, monkeypatch):
+    pointer = tmp_path / "MyScribe.location"
+    pointer.write_text(json.dumps({"home": str(tmp_path / "unplugged")}), encoding="utf-8")
+    monkeypatch.delenv(launcher.HOME_VARIABLE, raising=False)
+    monkeypatch.setattr(launcher, "default_home", lambda *a, **k: tmp_path / "MyScribe")
+    monkeypatch.setattr(launcher, "pointer_path", lambda *a, **k: pointer)
+    return tmp_path / "MyScribe-launcher.log"
+
+
+def test_a_headless_start_over_an_unplugged_drive_ends_with_zero_and_leaves_a_log(
+        layout, tmp_path, monkeypatch):
+    """Before a home there is no launcher.log, and behind --windowed no
+    stdout: the one sentence went nowhere. It goes beside the pointer, whose
+    folder is there whenever the pointer is."""
+    early = _unplugged(tmp_path, monkeypatch)
+
+    code = launcher.main(["--headless", "--at-login", "--no-browser",
+                          "--payload", str(layout.payload), "--port", str(_free_port())])
+
+    assert code == 0
+    said = early.read_text(encoding="utf-8")
+    assert "unplugged" in said and "not there" in said
+    assert not (tmp_path / "unplugged").exists() and not (tmp_path / "MyScribe").exists()
+
+
+def test_a_one_job_door_over_an_unplugged_drive_still_fails(layout, tmp_path, monkeypatch):
+    """--sync-only, --doctor and --smoke are read as pass or fail by CI and by
+    scripts; nothing supervises them, so they keep their 1."""
+    _unplugged(tmp_path, monkeypatch)
+
+    assert launcher.main(["--sync-only", "--payload", str(layout.payload)]) == 1
+
+
+def test_a_fresh_home_keeps_what_it_could_not_hold_in_the_early_log(layout, tmp_path, monkeypatch):
+    """A busy port is found before the home is made, so launcher.log has no
+    folder to go in yet; the sentence must not be lost with the process."""
+    early = _unplugged(tmp_path, monkeypatch)
+    held: list = []
+    try:
+        port, sentence = _port_busy(layout, monkeypatch, held)
+        launch = launcher.Launch(layout, port, False, lambda state, text: None)
+        code = launcher.run_headless(launch)
+    finally:
+        for sock in held:
+            sock.close()
+
+    assert code == 0 and not layout.home.exists()
+    assert sentence in early.read_text(encoding="utf-8")

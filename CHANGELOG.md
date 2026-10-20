@@ -7,6 +7,15 @@
   open MyScribe from its shortcut or at `http://localhost:4242`. An entry an
   earlier version wrote is brought up to date at the next start, and one you
   switched off stays off (TASK-112.01, ADR-026).
+- **The launcher's exit code says whether MyScribe crashed.** A server that
+  dies under a headless launcher now ends it with exit code 70, so whatever
+  started it can start it again. A clean stop, another MyScribe already
+  running, and a problem a restart cannot fix (an unplugged library drive, a
+  busy port, an install that failed offline) end with 0 and say why in
+  `launcher.log`. A start that stops before MyScribe knows its folder writes
+  the reason to `MyScribe-launcher.log` beside `MyScribe.location`, where it
+  used to go nowhere. `--sync-only`, `--doctor` and `--smoke` still exit 1 on
+  a failure (TASK-112.02).
 
 ### Fixed
 

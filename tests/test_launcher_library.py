@@ -130,9 +130,10 @@ def test_an_adopted_library_that_is_gone_stops_the_launcher_and_starts_nothing(
     gone = tmp_path / "unplugged" / "data"
     pointer.write_text(json.dumps({"home": str(home), "data": str(gone)}), encoding="utf-8")
 
-    assert _main(payload) == 1
+    assert _main(payload) == 0, "an unplugged drive is a configuration problem, not a crash (TASK-112.02)"
     assert started == []
     assert not (home / "data").exists()
+    assert "not there" in (tmp_path / "MyScribe-launcher.log").read_text(encoding="utf-8")
 
 
 def test_a_home_given_by_hand_keeps_everything_under_it(tmp_path, payload, pointer, started):
