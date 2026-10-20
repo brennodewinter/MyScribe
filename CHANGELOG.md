@@ -7,6 +7,11 @@
   where Windows refuses that (`os error 448`, GitHub issue #16) the install
   stopped. The launcher now syncs once more with the Python uv already
   downloaded, and says so (TASK-113.01, ADR-027).
+- **A failed install says what failed.** The advice to check the internet
+  connection now appears only when the download was the trouble; a failure on
+  the computer itself says so and names the log. The Setup button before the
+  speech engine is installed says that, instead of `[WinError 2]` and
+  "MyScribe starts anyway" (TASK-113.02, GitHub issue #16).
 
 ## [0.8.6] - 2026-10-19
 

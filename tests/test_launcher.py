@@ -332,6 +332,70 @@ def test_a_retry_that_fails_too_is_reported_once_and_not_repeated(layout, tmp_pa
     assert not layout.stamp_file.exists()
 
 
+# What uv 0.12.13 printed on 2026-10-20 with HTTPS_PROXY at a closed port (TASK-113.02).
+NETWORK_FAILURE = [
+    "error: Failed to download https://github.com/astral-sh/python-build-standalone/releases/download/"
+    "20260901/cpython-3.12.14%2B20260901-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+    "  Caused by: error sending request for url (https://github.com/astral-sh/python-build-standalone/...)",
+    "  Caused by: client error (Connect)",
+    "  Caused by: tunnel error: failed to create underlying connection",
+    "  Caused by: tcp connect error",
+    "  Caused by: No connection could be made because the target machine actively refused it. (os error 10061)",
+]
+
+
+def _failed_install(layout, tmp_path, monkeypatch, printed: list[str]) -> list[str]:
+    """The error lines `prepare` reports after a sync that printed `printed`."""
+    _no_proxy_configured(monkeypatch)
+    command, _log = _flaky_uv(tmp_path, printed, then=2)
+    monkeypatch.setattr(launcher, "uv_command", lambda _layout: command)
+    monkeypatch.setattr(launcher, "enough_disk", lambda *_args, **_kwargs: True)
+    reports: list[tuple[str, str]] = []
+
+    launch = launcher.Launch(layout, _free_port(), False, lambda s, t: reports.append((s, t)))
+
+    assert launch.prepare() is False
+    return [text for state, text in reports if state == "error"]
+
+
+def test_a_sync_that_failed_on_the_network_points_at_the_internet_connection(
+        layout, tmp_path, monkeypatch):
+    errors = _failed_install(layout, tmp_path, monkeypatch, NETWORK_FAILURE)
+
+    assert len(errors) == 1
+    assert "internet connection" in errors[0]
+
+
+def test_a_sync_that_failed_on_this_computer_does_not_blame_the_internet(
+        layout, tmp_path, monkeypatch):
+    """Issue 16: the link step failed on the file system, and the window said
+    to check the internet connection - which was fine (TASK-113.02 AC #1)."""
+    errors = _failed_install(layout, tmp_path, monkeypatch, MINOR_LINK_FAILURE)
+
+    assert len(errors) == 1
+    assert "internet" not in errors[0]
+    assert "on this computer" in errors[0]
+    assert str(layout.logs_dir / launcher.INSTALL_LOG) in errors[0]
+
+
+@pytest.mark.parametrize("printed", [
+    NETWORK_FAILURE,
+    # an unknown host for the Python download, then for the package index
+    ["error: Failed to download https://no-such-host.invalid/py/20260901/cpython-3.12.14.tar.gz",
+     "  Caused by: dns error"],
+    ["error: Failed to fetch: `https://no-such-host.invalid/simple/six/`",
+     "  Caused by: error sending request for url (https://no-such-host.invalid/simple/six/)"],
+], ids=["closed-proxy", "python-host", "index-host"])
+def test_what_uv_printed_without_a_network_counts_as_the_network(layout, printed):
+    assert "internet connection" in launcher.install_failure(layout, printed)
+
+
+def test_a_configured_proxy_alone_does_not_make_a_failure_a_network_one(layout):
+    said = MINOR_LINK_FAILURE + [f"uv sync failed with exit code 2{launcher.proxy_note({'HTTPS_PROXY': 'http://proxy:8080'})}"]
+
+    assert "internet" not in launcher.install_failure(layout, said)
+
+
 # --- the child environment --------------------------------------------------------
 
 

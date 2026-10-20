@@ -697,6 +697,27 @@ def sync(layout: Layout, on_line: Callable[[str], None], base: dict | None = Non
     return True
 
 
+NETWORK_FAILURES = ("Failed to download", "Failed to fetch", "error sending request",
+                    "dns error", "tcp connect error", "certificate", "timed out")
+"""What uv 0.12.13 prints when the network is the trouble. Captured on
+2026-10-20 with a closed proxy, an unknown host for the Python download and
+one for the package index (TASK-113.02). Not "proxy": `proxy_note` adds that
+word to every failed sync on a machine with a proxy, network or not."""
+
+
+def install_failure(layout: Layout, said: Iterable[str]) -> str:
+    """The sentence after a failed sync: the internet only when uv blamed it.
+
+    Issue 16 failed on the file system and was told to check the internet
+    connection, which was fine.
+    """
+    if any(marker in text for text in said for marker in NETWORK_FAILURES):
+        return ("Installing failed; the lines above say why. Check the internet connection "
+                "and start MyScribe again.")
+    return (f"Installing failed on this computer; the lines above say why, and they are also in "
+            f"{layout.logs_dir / INSTALL_LOG}.")
+
+
 # --- what this install costs, and whether it fits ---------------------------------
 #
 # Every number comes out of the payload as data, because the launcher may
@@ -1604,9 +1625,14 @@ class Launch:
         if needs_sync(self.layout):
             self.report("status", "Installing the speech engine. " + download_note(self.layout)
                         + " Later starts skip this.")
-            if not sync(self.layout, lambda line: self.report("busy", line)):
-                self.report("error", "Installing failed; the lines above say why. Check the "
-                                     "internet connection and start MyScribe again.")
+            said: list[str] = []
+
+            def line(text: str) -> None:
+                said.append(text)
+                self.report("busy", text)
+
+            if not sync(self.layout, line):
+                self.report("error", install_failure(self.layout, said))
                 return False
         return True
 
@@ -1933,6 +1959,12 @@ def setup_plan(layout: Layout, report: Callable[[str, str], None], *,
                              env=app_environment(layout), cwd=layout.app_dir,
                              on_line=lines.append, on_start=on_start)
     except Exception as error:
+        if not layout.env_python.exists():
+            # Issue 16: the Setup button after a failed install. Nothing starts
+            # anyway, and WinError 2 says nothing to the person reading it.
+            report("error", "The speech engine is not installed yet, so the setup questions "
+                            "cannot be asked. Start MyScribe again to install it.")
+            return None
         report("error", f"The setup questions could not be read: {error}. MyScribe starts anyway; "
                         "the questions are also in Settings.")
         return None
