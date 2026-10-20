@@ -1334,6 +1334,10 @@ class AppProcess:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def exit_code(self) -> int | None:
+        """What the app ended with, or None while it runs or before it started."""
+        return None if self.proc is None else self.proc.poll()
+
     def wait_ready(self, timeout: float = READY_TIMEOUT) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -1383,6 +1387,31 @@ SMOKE_LOG = "launcher-smoke.log"
 SYNCED = "The speech engine is installed and up to date."
 UP_TO_DATE = "The speech engine was already up to date; nothing was downloaded."
 REDACTED = "***"
+
+
+def early_log_path(pointer: Path | None = None) -> Path:
+    """Where the lines said before a home exists are kept: beside the pointer
+    file, as ``MyScribe-launcher.log`` next to ``MyScribe.location``.
+
+    Beside it for the reason the pointer is there: its folder exists whether
+    or not the home does, and nothing has to be made under a default home a
+    moved MyScribe no longer uses. Behind ``--windowed`` and at login there is
+    no stdout, so without this the drive that was not plugged in ended the
+    launcher without a word anywhere (TASK-112.02).
+    """
+    pointer = pointer_path() if pointer is None else pointer
+    return pointer.with_name(pointer.stem + "-launcher.log")
+
+
+def write_early(lines: Iterable[str], pointer: Path | None = None) -> None:
+    """Append to the early log, each line with the time it was written.
+
+    Timestamped where launcher.log is not: this file is not rewritten per
+    install, and the next login's lines land under the last one's."""
+    log = InstallLog(early_log_path(pointer))
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    for line in lines:
+        log.write(f"{stamp} {line}")
 
 
 class InstallLog:
@@ -2266,26 +2295,56 @@ def first_run(launch: Launch, ask: Callable[[dict], dict | None] | None,
     return launch.start_app()
 
 
+APP_DIED = 70
+"""The one non-zero exit of a door that serves: the app child died under it.
+
+A supervisor that restarts on a non-zero exit - launchd's KeepAlive with
+SuccessfulExit false, systemd's Restart=on-failure - reads the launcher's code
+and nothing else, so the contract is that only a crash asks for a restart.
+A clean stop, another instance already serving and a configuration problem
+(no library drive, a busy port, a sync that failed offline, an app that never
+answered) end with 0 and say why in the log: a restart cannot plug a drive in,
+and under launchd it would retry a multi-GB sync every ten seconds. 70 is
+EX_SOFTWARE from sysexits.h, clear of the 1 Python itself exits with on an
+uncaught exception (TASK-112.02)."""
+
+
 def run_headless(launch: Launch, force_setup: bool = False, at_login: bool = False) -> int:
-    """The console door, and every build without Tk.
+    """The console door, and every build without Tk; the exit code is
+    `APP_DIED`'s contract.
 
     It goes through `first_run` with no `ask`, so that a first start here is
     asked the same questions a window is - by the engine, with the terminal
     handed to it. Until TASK-089.15 this door ran `launch.run()`, which asks
     nothing at all: `--setup` on a Mac or in WSL did nothing visible.
+
+    An app that never answered at start counts as a configuration problem and
+    not as a crash: restarting it repeats the same failure.
     """
-    if not first_run(launch, None, launch.report, force_setup, at_login):
-        return 1
-    if launch.serving or launch.app is None:  # another instance is serving
+    if not first_run(launch, None, launch.report, force_setup, at_login)             or launch.serving or launch.app is None:
+        # A busy port or a running instance is found before the home is made;
+        # on a fresh machine launcher.log has no folder yet to hold the line.
+        if launch.log.pending:
+            write_early(launch.log.pending)
         return 0
+    interrupted = False
     try:
         with stop_on_sigterm():
             while launch.app.alive():
                 time.sleep(0.5)
     except KeyboardInterrupt:
-        pass
+        interrupted = True
     finally:
         launch.stop()
+    if interrupted:
+        launch.report("status", "MyScribe was stopped.")
+        return 0
+    code = launch.app.exit_code()
+    if code:
+        launch.report("error", f"MyScribe stopped unexpectedly (exit code {code}); see "
+                               f"{launch.layout.logs_dir / 'app.log'}.")
+        return APP_DIED
+    launch.report("status", "MyScribe stopped.")
     return 0
 
 
@@ -3016,13 +3075,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
 
     problems: list[str] = []
+    before_home = [True]
 
     def console(state: str, text: str) -> None:
         if state == "error":
             problems.append(text)
+            if before_home[0]:  # no launcher.log to say it in yet (TASK-112.02)
+                write_early([text])
         print(text, flush=True)
 
     quiet = args.sync_only or args.doctor is not None or args.smoke
+    # `APP_DIED`'s contract is for the doors that serve. The one-job doors are
+    # read as pass or fail by CI and by scripts, and nothing restarts them.
+    stopped = 1 if quiet else 0
     windowed = not quiet and not args.headless and tkinter_present()
     # Where everything goes is settled here, before a Layout exists: nothing
     # may be written under any home, and nothing downloaded, until it is
@@ -3037,7 +3102,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         # silence, so the last sentence gets a window of its own.
         if windowed and problems:
             show_error(problems[-1])
-        return 1
+        return stopped
     # TASK-089.19: an adopted library, the pointer's second fact. Not under a
     # home given by hand: `--home` and MYSCRIBE_HOME mean "everything here".
     data, missing, pointer = None, "", None
@@ -3048,8 +3113,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         console("error", missing)
         if windowed:
             show_error(missing)
-        return 1
+        return stopped
     layout = Layout(home, payload, data=data, pointer=pointer)
+    before_home[0] = False
     if args.setup:  # where everything is, and the three ways to move it (ADR-015)
         pointer = pointer_path()
         console("status", location_note(layout.home, pointer, home_source(args.home, pointer=pointer)))
