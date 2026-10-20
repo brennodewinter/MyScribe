@@ -644,15 +644,52 @@ def loopback_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+# What uv prints when it downloaded Python but could not make the junction
+# beside it (GitHub issue 16, ADR-027). uv has no switch to skip that step.
+MINOR_LINK_FAILURE = "Failed to create Python minor version link directory"
+
+
+def downloaded_python(layout: Layout) -> Path | None:
+    """The newest interpreter uv unpacked under the python dir, or None.
+
+    Only a ``cpython-X.Y.Z-...`` folder counts: ``cpython-X.Y-...`` is the
+    minor version link itself (or what is left of it), and a ``+`` variant
+    such as freethreaded is not what the lock was made for.
+    """
+    found = []
+    for folder in layout.python_dir.glob("cpython-*"):
+        match = re.fullmatch(r"cpython-(\d+)\.(\d+)\.(\d+)-[^+]+", folder.name)
+        executable = folder / "python.exe" if layout.windows else folder / "bin" / "python3"
+        if match and executable.is_file():
+            found.append((tuple(int(part) for part in match.groups()), executable))
+    return max(found)[1] if found else None
+
+
 def sync(layout: Layout, on_line: Callable[[str], None], base: dict | None = None) -> bool:
     """Sync the environment; write the stamp only when uv succeeded.
 
     The proxy named on the failure is the one the child was given, not this
     process's: a caller that hands `sync` a different environment would
     otherwise be told about the launcher's own.
+
+    A sync that failed only on the minor version link is run once more with
+    ``--python`` naming the interpreter uv already unpacked: uv makes that
+    link only on the download path, and a venv does without it (ADR-027).
     """
     env = sync_environment(layout, base)
-    code = run_streaming(sync_command(layout), env=env, cwd=layout.home, on_line=on_line)
+    seen: list[str] = []
+
+    def line(text: str) -> None:
+        seen.append(text)
+        on_line(text)
+
+    code = run_streaming(sync_command(layout), env=env, cwd=layout.home, on_line=line)
+    python = downloaded_python(layout) if code != 0 and any(MINOR_LINK_FAILURE in text for text in seen) else None
+    if python is not None:
+        on_line("uv could not make its Python folder link; trying once more with the "
+                f"Python it already downloaded ({python.parent.name})")
+        code = run_streaming(sync_command(layout) + ["--python", str(python)],
+                             env=env, cwd=layout.home, on_line=on_line)
     if code != 0:
         on_line(f"uv sync failed with exit code {code}{proxy_note(env)}")
         return False
