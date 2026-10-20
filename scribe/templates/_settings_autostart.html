@@ -41,6 +41,10 @@
     <code>scripts/start</code> script next to it.
   </p>
   {% else %}
+  <p class="hint">
+    Started at login, MyScribe runs without a window. Open it the way you start it by hand -
+    its shortcut or menu entry - or go to <code>http://localhost:4242</code> in your browser.
+  </p>
   <dl class="facts">
     <dt>Starts when you log in</dt>
     <dd>{{ 'Yes' if autostart.on else 'No' }}</dd>

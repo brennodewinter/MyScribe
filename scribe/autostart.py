@@ -303,19 +303,23 @@ def start_command(
     `--no-browser` on both, because a tab that opens at every login is the
     annoyance the entry exists to avoid. `--at-login` is the launcher's own,
     and leaves a first-run sitting that is due for the next start somebody
-    makes by hand.
+    makes by hand. `--headless` is the launcher's too: no window to keep open
+    and, the Windows build being windowed, no console either (ADR-026). The
+    clone doors do not get it - their scripts hand their arguments to
+    `python -m scribe`, and already start it detached and hidden.
     """
     environ = os.environ if environ is None else environ
     launcher = environ.get(LAUNCHER_VARIABLE)
     if launcher:
+        arguments = ("--at-login", "--no-browser", "--headless")
         if platform == "darwin":
             # The stable path on a Mac is the `.app` bundle, which is a
             # directory - and launchd hands ProgramArguments straight to
             # execvp, so a directory there fails to spawn at every login.
             # `open -a <bundle> --args ...` is open(1)'s documented way to
             # start a bundle with arguments.
-            return ("/usr/bin/open", "-a", launcher, "--args", "--at-login", "--no-browser")
-        return (launcher, "--at-login", "--no-browser")
+            return ("/usr/bin/open", "-a", launcher, "--args", *arguments)
+        return (launcher, *arguments)
 
     root = Path(__file__).resolve().parent.parent if repo is None else Path(repo)
     if platform == "win32":
@@ -368,6 +372,39 @@ def enable(mechanism=None, command=None) -> Entry:
     command = command or start_command()
     if not command:
         raise NothingToStart("nothing on this machine is known to start MyScribe at login")
+    mechanism.write(command)
+    return Entry(where=mechanism.where, command=mechanism.render(command), on=True)
+
+
+def refresh(mechanism=None, command=None, environ: dict | None = None) -> Entry | None:
+    """Bring an entry an older version wrote up to today's command.
+
+    0.8.6 and earlier registered no `--headless`, so their login opened the
+    launcher's window (ADR-026's Must: rewritten at the next start). Returns
+    the entry when it was rewritten, None when nothing was written:
+
+    * an entry that is off stays off - a missing one, or one the desktop hides;
+    * only a process the launcher started rewrites, so a clone on the same
+      machine cannot point a release's entry at its start script;
+    * only an entry that already names this same launcher, so a second
+      install does not take over somebody else's.
+    """
+    environ = os.environ if environ is None else environ
+    launcher = environ.get(LAUNCHER_VARIABLE)
+    if not launcher:
+        return None
+    mechanism = mechanism or default_mechanism(environ=environ)
+    registered = mechanism.read()
+    if registered is None:
+        return None
+    named, held = mechanism.render((launcher,)), registered
+    if isinstance(mechanism, WindowsRun):  # a path there is the same path in any case
+        named, held = named.casefold(), held.casefold()
+    if named not in held:
+        return None
+    command = command or start_command(environ)
+    if not command or mechanism.render(command) == registered:
+        return None
     mechanism.write(command)
     return Entry(where=mechanism.where, command=mechanism.render(command), on=True)
 
