@@ -994,6 +994,24 @@ def test_the_setup_route_asks_for_the_whole_plan(layout, monkeypatch):
     assert asked == [False, True]
 
 
+def test_the_setup_button_before_the_engine_is_installed_says_so(layout):
+    """Issue 16: Setup after a failed install ran the plan with a python that
+    was never made, and said `[WinError 2] ... MyScribe starts anyway` while
+    nothing could start (TASK-113.02 AC #2). No sitting opens either."""
+    reports: list[tuple[str, str]] = []
+    launch = launcher.Launch(layout, _free_port(), False, lambda s, t: reports.append((s, t)))
+    asked: list[dict] = []
+
+    launcher.open_sitting(launch, lambda plan: asked.append(plan), launch.report, force_setup=True)
+
+    errors = [text for state, text in reports if state == "error"]
+    assert asked == [], "a sitting opened without an engine to apply it"
+    assert len(errors) == 1
+    assert "not installed yet" in errors[0]
+    assert "starts anyway" not in errors[0]
+    assert "WinError" not in errors[0] and "Errno" not in errors[0]
+
+
 def test_a_plan_is_read_although_the_child_said_something_around_it(layout, monkeypatch, tmp_path):
     """The child's stderr shares this pipe. A warning printed after the
     document is as likely as one before it - `warnings`, or an "Exception
