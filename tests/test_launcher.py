@@ -2487,8 +2487,17 @@ def test_a_browser_that_refuses_is_said_with_the_address(monkeypatch):
 # a crash asks for a restart, and nothing else does.
 
 
+def _app_child(code: str):
+    """A child in a session of its own, as `AppProcess.start` makes the app.
+
+    Never in pytest's: `AppProcess.stop` sends SIGTERM and then SIGKILL to the
+    child's whole process group, and on POSIX a child that shares the group
+    takes pytest - and on CI the runner - down with it."""
+    return _subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+
+
 def _sleeping_child(seconds: int = 60):
-    return _subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({seconds})"])
+    return _app_child(f"import time; time.sleep({seconds})")
 
 
 def _launch_over(layout, child, monkeypatch):
@@ -2521,7 +2530,7 @@ def test_an_app_that_dies_ends_the_headless_launcher_with_its_own_code(layout, m
 def test_an_app_that_ends_by_itself_without_an_error_ends_the_launcher_with_zero(layout, monkeypatch):
     """The other half: a non-zero code only for a crash, or a stop route
     (TASK-112.03) would be restarted by the mechanism it was meant to end."""
-    child = _subprocess.Popen([sys.executable, "-c", "pass"])
+    child = _app_child("pass")
     launch = _launch_over(layout, child, monkeypatch)
 
     assert launcher.run_headless(launch) == 0
