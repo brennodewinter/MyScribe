@@ -1,3 +1,4 @@
+import os
 import sqlite3
 
 import pytest
@@ -763,3 +764,20 @@ def test_unsubscribing_forgets_what_that_feed_had_seen(conn):
     conn.commit()
 
     assert conn.execute("SELECT COUNT(*) FROM feed_seen").fetchone()[0] == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="mode bits are a POSIX answer; Windows has ACLs")
+def test_the_database_file_is_private(tmp_path):
+    """Transcripts and cleartext API keys live in this file; 0644 is wrong."""
+    import stat
+
+    conn = db.connect(tmp_path / "private.db")
+    conn.execute("CREATE TABLE probe(id INTEGER)")  # force the -wal into being
+    conn.commit()
+    conn.close()
+
+    assert stat.S_IMODE((tmp_path / "private.db").stat().st_mode) == 0o600
+    for sidecar in ("private.db-wal", "private.db-shm"):
+        file = tmp_path / sidecar
+        if file.exists():
+            assert stat.S_IMODE(file.stat().st_mode) == 0o600, sidecar

@@ -1,3 +1,8 @@
+import os
+import stat
+
+import pytest
+
 from scribe import paths
 
 
@@ -8,6 +13,39 @@ def test_dirs_are_under_repo_data(tmp_path, monkeypatch):
     assert paths.DB_PATH.parent == paths.DATA_DIR
     assert paths.MEDIA_DIR.is_dir() and paths.LOGS_DIR.is_dir()
     assert paths.WORK_DIR.is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="mode bits are a POSIX answer; Windows has ACLs")
+def test_a_data_dir_the_app_makes_is_private(tmp_path, monkeypatch):
+    """The library holds transcripts, recordings and API keys: a fresh one
+    starts at 0700, not the umask's 0755."""
+    data = tmp_path / "fresh"
+    monkeypatch.setattr(paths, "DATA_DIR", data)
+    monkeypatch.setattr(paths, "MEDIA_DIR", data / "media")
+    monkeypatch.setattr(paths, "LOGS_DIR", data / "logs")
+    monkeypatch.setattr(paths, "WORK_DIR", data / "work")
+    monkeypatch.setattr(paths, "MODELS_DIR", data / "models")
+
+    paths.ensure_dirs()
+
+    assert stat.S_IMODE(data.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="mode bits are a POSIX answer; Windows has ACLs")
+def test_a_data_dir_the_app_did_not_make_keeps_its_mode(tmp_path, monkeypatch):
+    """A mode somebody chose on purpose is theirs: ensure_dirs must not
+    tighten it back at every start."""
+    data = tmp_path / "existing"
+    data.mkdir(mode=0o755)
+    monkeypatch.setattr(paths, "DATA_DIR", data)
+    monkeypatch.setattr(paths, "MEDIA_DIR", data / "media")
+    monkeypatch.setattr(paths, "LOGS_DIR", data / "logs")
+    monkeypatch.setattr(paths, "WORK_DIR", data / "work")
+    monkeypatch.setattr(paths, "MODELS_DIR", data / "models")
+
+    paths.ensure_dirs()
+
+    assert stat.S_IMODE(data.stat().st_mode) == 0o755
 
 
 def test_each_job_gets_its_own_work_directory():

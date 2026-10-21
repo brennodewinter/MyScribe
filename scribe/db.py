@@ -569,6 +569,13 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    # Transcripts and cleartext API keys live in here; SQLite creates the file
+    # with the process umask, and 0644 is the wrong default for that (the same
+    # answer .env got). The -wal/-shm sidecars carry the same bytes.
+    path = Path(path)
+    for file in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+        if file.exists():
+            paths.keep_private(file, 0o600)
     return conn
 
 

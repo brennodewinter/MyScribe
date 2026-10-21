@@ -70,8 +70,34 @@ def refresh() -> None:
 
 
 def ensure_dirs() -> None:
+    created = not DATA_DIR.exists()
     for p in (DATA_DIR, MEDIA_DIR, LOGS_DIR, WORK_DIR, MODELS_DIR):
         p.mkdir(parents=True, exist_ok=True)
+    if created:
+        # Only a directory this call made gets its mode set: chmod on every
+        # start would fight a person who deliberately opened their library
+        # to a group. The sensitive files inside an existing directory are
+        # still tightened by their own writers (db.connect, applog).
+        keep_private(DATA_DIR, 0o700)
+
+
+def keep_private(path: Path, mode: int) -> None:
+    """``chmod path mode``, POSIX only, and never fatal.
+
+    The library holds transcripts, recordings and API keys in cleartext, so
+    world-readable is the wrong default for anything under DATA_DIR: `.env`
+    is written 0600, and this is the same answer for everything else. A
+    0700 DATA_DIR makes every sibling user unable to reach whatever lands
+    below. Windows has ACLs, not mode bits; there the directory's own
+    permissions are already the answer. A chmod that fails (a filesystem
+    without modes, a file we do not own) must not refuse to start over.
+    """
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
 
 
 def job_work_dir(job_id: int) -> Path:
