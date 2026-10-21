@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -845,31 +846,51 @@ def test_the_remux_timeout_scales_with_the_chunks(tmp_path):
     assert recording._remux_timeout([tmp_path / "b.webm"]) == 90.0
 
 
-def test_a_stuck_remux_is_a_failure_not_a_hang(tmp_path, monkeypatch):
-    """A remux that never finishes is killed, its half file removed, and the
-    stop request gets a RemuxFailed rather than a thread that never returns."""
+def test_a_remux_that_stops_reading_is_a_failure_not_a_hang(tmp_path, monkeypatch):
+    """GitHub #34: the stall is an ffmpeg that stops reading stdin. The pipe
+    fills, the feed blocks on its write, and a timeout that only guards the
+    wait after the feed is never reached. A real child that never reads
+    stands in for ffmpeg here, with more bytes than any pipe buffers, so the
+    bound has to cover the feed too: killed, half file removed, RemuxFailed."""
     chunk = tmp_path / "c.webm"
-    chunk.write_bytes(b"x")
-
-    class Hung:
-        def __init__(self):
-            self.stdin = open(os.devnull, "wb")
-            self.killed = False
-
-        def wait(self, timeout=None):
-            if self.killed:
-                return -9
-            raise subprocess.TimeoutExpired("ffmpeg", timeout)
-
-        def kill(self):
-            self.killed = True
-
-    hung = Hung()
-    monkeypatch.setattr(recording.subprocess, "Popen", lambda *a, **k: hung)
+    with open(chunk, "wb") as f:
+        f.truncate(8 * recording.COPY_SIZE)  # far past any pipe's buffer
     dst = tmp_path / "out.mkv"
-    dst.write_bytes(b"partial")  # what ffmpeg managed before it hung
+    dst.write_bytes(b"partial")  # what ffmpeg managed before it stalled
 
-    with pytest.raises(recording.RemuxFailed):
-        recording.remux([chunk], dst)
+    children = []
+    real_popen = subprocess.Popen
 
-    assert hung.killed and not dst.exists()
+    def deaf_ffmpeg(cmd, **kwargs):
+        child = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"], **kwargs
+        )
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(recording.subprocess, "Popen", deaf_ffmpeg)
+    monkeypatch.setattr(recording, "_remux_timeout", lambda chunks: 0.5)
+
+    outcome = {}
+
+    def run():
+        try:
+            outcome["result"] = recording.remux([chunk], dst)
+        except BaseException as exc:  # noqa: BLE001 - handed to the assert below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(15)
+    try:
+        assert not worker.is_alive(), "remux still blocked feeding a child that never reads"
+    finally:
+        for child in children:  # a red run must not leave the sleeper behind
+            child.kill()
+            child.wait()
+        worker.join(15)
+
+    assert time.monotonic() - started < 10
+    assert isinstance(outcome.get("error"), recording.RemuxFailed), outcome
+    assert not dst.exists()

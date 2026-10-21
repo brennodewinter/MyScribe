@@ -230,11 +230,16 @@ def _transcode_timeout(src: Path) -> float:
     thread and this proxy's lock for good. An unmeasurable source gets an
     hour: a file ffprobe cannot read is an oddity already, and that bound
     is what keeps the oddity from being a deadlock.
+
+    Capped at four hours: twice a ten-hour file would let one stuck ffmpeg
+    hold the GET and `_proxy_lock` for twenty (GitHub #35). AAC at
+    `PROXY_BITRATE` runs many times faster than real time, so four hours
+    is still far beyond any honest transcode.
     """
     duration = probe_duration(src)
     if duration is None:
         return 3600.0
-    return max(600.0, duration * 2.0)
+    return min(max(600.0, duration * 2.0), 4 * 3600.0)
 
 
 def transcode(src: Path, dst: Path) -> None:

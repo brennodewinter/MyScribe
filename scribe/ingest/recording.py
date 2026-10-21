@@ -47,6 +47,7 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -392,6 +393,9 @@ def remux(chunks: list[Path], dst: str | Path) -> Path:
     log = dst.with_name(dst.name + ".ffmpeg.log")
 
     try:
+        # Before the spawn: a chunk that fails its stat() must not leave an
+        # ffmpeg behind holding the log open.
+        limit = _remux_timeout(chunks)
         with open(log, "wb") as errors:
             proc = subprocess.Popen(
                 [
@@ -408,24 +412,36 @@ def remux(chunks: list[Path], dst: str | Path) -> Path:
                 stderr=errors,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            # One watchdog over the feed and the wait together (GitHub #34): an
+            # ffmpeg that stops reading fills the pipe, and `_feed` then
+            # blocks on its write long before any wait(timeout=) is reached.
+            # The kill breaks the pipe, `_feed` swallows that, and the wait
+            # returns - so the bound holds wherever the stall is.
+            timed_out = threading.Event()
+
+            def give_up() -> None:
+                timed_out.set()
+                proc.kill()
+
+            watchdog = threading.Timer(limit, give_up)
+            watchdog.daemon = True
+            watchdog.start()
             try:
                 _feed(proc, chunks)
-                try:
-                    returncode = proc.wait(timeout=_remux_timeout(chunks))
-                except subprocess.TimeoutExpired:
-                    # Kill before the unlink: Windows refuses to delete a
-                    # file a process still holds open.
-                    proc.kill()
-                    proc.wait()
-                    dst.unlink(missing_ok=True)
-                    raise RemuxFailed(
-                        "ffmpeg did not finish assembling the recording in time"
-                    ) from None
+                returncode = proc.wait()
             except BaseException:
                 proc.kill()
                 proc.wait()
                 raise
+            finally:
+                watchdog.cancel()
 
+        if timed_out.is_set():
+            # ffmpeg is dead and waited for by now: the unlink comes after
+            # the kill because Windows refuses to delete a file a process
+            # still holds open.
+            dst.unlink(missing_ok=True)
+            raise RemuxFailed("ffmpeg did not finish assembling the recording in time")
         if returncode != 0:
             # Half a file is worse than none: the next thing to look at this
             # directory would ingest it.

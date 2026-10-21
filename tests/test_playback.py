@@ -20,6 +20,8 @@ which is about what ffmpeg writes.
 import logging
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -396,16 +398,28 @@ def test_the_transcode_timeout_scales_with_the_source(monkeypatch, tmp_path):
     assert playback._transcode_timeout(tmp_path / "x.mkv") == 3600.0
 
 
+def test_the_transcode_timeout_has_a_ceiling(monkeypatch, tmp_path):
+    """Twice a ten-hour recording would let one stuck ffmpeg hold the GET and
+    the proxy lock for twenty hours; the bound stops at four."""
+    monkeypatch.setattr(playback, "probe_duration", lambda path: 10 * 3600.0)
+    assert playback._transcode_timeout(tmp_path / "x.mkv") == 4 * 3600.0
+
+
 def test_a_stuck_transcode_is_a_refusal_not_a_hang(data_dir, monkeypatch, tmp_path):
     """A transcode that never returns must not hold the request thread and
-    the proxy lock forever: it is a ProxyError like every other ffmpeg no."""
+    the proxy lock forever: it is a ProxyError like every other ffmpeg no.
+    A real child that just sleeps stands in for the stuck ffmpeg, so the
+    kill and the pipes are exercised, not a mock of them."""
     original = _original(data_dir, b"\x1aE\xdf\xa3", ".mkv")
-    monkeypatch.setattr(playback, "probe_duration", lambda path: 60.0)
+    monkeypatch.setattr(playback, "_transcode_timeout", lambda src: 0.5)
+    real_run = subprocess.run
 
-    def hang(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+    def stuck_ffmpeg(cmd, **kwargs):
+        return real_run([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
 
-    monkeypatch.setattr(playback.subprocess, "run", hang)
+    monkeypatch.setattr(playback.subprocess, "run", stuck_ffmpeg)
 
+    started = time.monotonic()
     with pytest.raises(playback.ProxyError, match="did not finish"):
         playback.transcode(original, tmp_path / "out.part")
+    assert time.monotonic() - started < 10
