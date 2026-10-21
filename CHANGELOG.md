@@ -1,5 +1,14 @@
 ## [Unreleased]
 
+### Added
+
+- **MyScribe can be stopped.** Settings > *Start at login* has a **Stop
+  MyScribe** button, and the launcher takes `--stop`. A job that is running
+  goes back to the front of the queue and starts over the next time MyScribe
+  starts, so a stop loses no recording (TASK-112.03, ADR-028). If MyScribe does
+  not stop within a minute, `--stop` ends it; that job is then marked
+  interrupted. See *Stopping MyScribe* in `docs/installation.md`.
+
 ### Changed
 
 - **Started at login, MyScribe runs without a window.** The login entry now

@@ -2648,3 +2648,202 @@ def test_a_fresh_home_keeps_what_it_could_not_hold_in_the_early_log(layout, tmp_
 
     assert code == 0 and not layout.home.exists()
     assert sentence in early.read_text(encoding="utf-8")
+
+
+# --- TASK-112.03: MyScribe --stop -------------------------------------------------
+
+
+class _FakeServer:
+    """/health naming a real process as the app, and a stop route that ends it
+    the way the real one does - or, with ``obeys=False``, answers and ignores
+    the ask, the server the hard stop is for."""
+
+    def __init__(self, app_pid: int, on_stop, obeys: bool = True, launcher_pid: int | None = None):
+        self.posted: list[str] = []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self, code, body):
+                data = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                self._answer(200, {"ok": True, "pid": app_pid, "launcher_pid": launcher_pid})
+
+            def do_POST(self):
+                fake.posted.append(self.path)
+                self._answer(202, {"stopping": True, "pid": app_pid, "running_job": None})
+                if obeys:
+                    threading.Thread(target=on_stop, daemon=True).start()
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _orphan_app() -> int:
+    """A sleeping process that is nobody's child here, as the app is to a
+    `--stop` started from another shell: started through a parent that exits,
+    in a session of its own, so its exit is reaped by the system and not left
+    as a zombie that still answers `kill(pid, 0)`."""
+    spawn = ("import subprocess, sys; flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0); "
+             "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+             "start_new_session=sys.platform != 'win32', creationflags=flags, "
+             "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+             "print(p.pid)")
+    return int(_subprocess.run([sys.executable, "-c", spawn], capture_output=True, text=True,
+                               check=True).stdout.strip())
+
+
+def _end(pid: int) -> None:
+    try:
+        os.kill(pid, _signal.SIGTERM)  # TerminateProcess on Windows
+    except OSError:
+        pass
+
+
+def _gone(pid: int, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not launcher.pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _stop_with(pid, obeys, wait=10.0):
+    said: list[tuple[str, str]] = []
+    fake = _FakeServer(pid, lambda: (fake.close(), _end(pid)), obeys=obeys)
+    try:
+        code = launcher.stop_running(fake.port, lambda state, text: said.append((state, text)),
+                                     wait=wait)
+    finally:
+        if not obeys:
+            fake.close()
+    return code, said, fake
+
+
+def test_stop_asks_the_running_server_and_waits_for_its_process(monkeypatch):
+    pid = _orphan_app()
+    hard: list = []
+    monkeypatch.setattr(launcher, "end_tree", lambda target: hard.append(target))
+    try:
+        code, said, fake = _stop_with(pid, True)
+
+        assert code == 0 and fake.posted == ["/api/shutdown"]
+        assert not launcher.pid_alive(pid), "--stop returned while the app still ran"
+        assert hard == [], "the hard stop ran although the server stopped itself"
+        assert "starts over" in said[-1][1]
+    finally:
+        _end(pid)
+
+
+def test_stop_ends_a_server_that_does_not_stop_and_says_what_that_costs():
+    pid = _orphan_app()
+    try:
+        code, said, fake = _stop_with(pid, False, wait=1.0)
+
+        assert code == 0 and fake.posted == ["/api/shutdown"]
+        assert _gone(pid), "the hard stop left the app running"
+        assert any("interrupted" in text for _state, text in said)
+    finally:
+        _end(pid)
+
+
+def test_stop_with_nothing_running_says_so_and_succeeds():
+    said: list = []
+    assert launcher.stop_running(_free_port(), lambda state, text: said.append(text)) == 0
+    assert "not running" in said[-1]
+
+
+def test_asking_whether_a_process_lives_does_not_end_it():
+    """On Windows `os.kill(pid, 0)` is TerminateProcess with exit code 0: the
+    obvious liveness check would be the stop itself."""
+    child = _sleeping_child()
+    try:
+        assert launcher.pid_alive(child.pid)
+        time.sleep(0.2)
+        assert child.poll() is None, "asking killed it"
+    finally:
+        child.kill()
+        child.wait(10)
+    assert not launcher.pid_alive(child.pid)
+
+
+def test_the_stop_flag_reaches_stop_running(monkeypatch, tmp_path):
+    asked: list = []
+    monkeypatch.setattr(launcher, "pointer_path", lambda *a, **k: tmp_path / "MyScribe.location")
+    monkeypatch.setattr(launcher, "stop_running", lambda port, report, **k: asked.append(port) or 0)
+
+    assert launcher.main(["--stop", "--port", "4299"]) == 0
+    assert asked == [4299]
+
+
+_FAKE_LAUNCHER = """
+import os, signal, subprocess, sys, time
+marker = sys.argv[1]
+app = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                       start_new_session=sys.platform != "win32",
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def stop(*_):  # what run_headless does on SIGTERM: end the app's group, exit 0
+    os.killpg(app.pid, signal.SIGTERM)
+    app.wait(10)
+    open(marker, "w").write("0")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+print(os.getpid(), app.pid, flush=True)
+time.sleep(60)
+"""
+
+
+def _orphan_launcher(tmp_path) -> tuple[int, int, Path]:
+    """A launcher and its app, both nobody's child here, as `--stop` from
+    another shell finds them in production."""
+    script = tmp_path / "fake_launcher.py"
+    script.write_text(_FAKE_LAUNCHER, encoding="utf-8")
+    marker = tmp_path / "launcher-exit.txt"
+    out = tmp_path / "pids.txt"
+    spawn = ("import subprocess, sys; flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0); "
+             f"subprocess.Popen([sys.executable, {str(script)!r}, {str(marker)!r}], "
+             "start_new_session=sys.platform != 'win32', creationflags=flags, "
+             f"stdin=subprocess.DEVNULL, stdout=open({str(out)!r}, 'w'), stderr=subprocess.DEVNULL)")
+    _subprocess.run([sys.executable, "-c", spawn], check=True)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if out.exists() and len(out.read_text().split()) == 2:
+            break
+        time.sleep(0.1)
+    launcher_pid, app_pid = (int(n) for n in out.read_text().split())
+    return launcher_pid, app_pid, marker
+
+
+def test_the_hard_stop_ends_the_launcher_so_it_exits_clean_and_takes_its_app(tmp_path):
+    """Production's hard stop: /health names the launcher. Ending the
+    launcher - not the app under it - is what keeps a supervisor from
+    reading a crash and starting the server again (TASK-112.02)."""
+    launcher_pid, app_pid, marker = _orphan_launcher(tmp_path)
+    said: list = []
+    fake = _FakeServer(app_pid, lambda: None, obeys=False, launcher_pid=launcher_pid)
+    try:
+        code = launcher.stop_running(fake.port, lambda state, text: said.append(text), wait=1.0)
+    finally:
+        fake.close()
+        for pid in (app_pid, launcher_pid):
+            _end(pid)
+
+    assert code == 0
+    assert _gone(app_pid) and _gone(launcher_pid)
+    if sys.platform != "win32":  # taskkill /F gives a Windows launcher no handler to run
+        assert marker.read_text() == "0", "the launcher did not stop through its own handler"
+    assert any("interrupted" in text for text in said)

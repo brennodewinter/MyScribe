@@ -1,5 +1,6 @@
 """Task 6: FastAPI shell and JSON job API (supervisor off in tests)."""
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -42,11 +43,13 @@ def _row(conn, job_id):
 # --- /health ------------------------------------------------------------------
 
 
-def test_health_ok_with_version(client):
+def test_health_ok_with_version(client, monkeypatch):
     """The body, exactly: `ok` and the version the launcher reads, plus the
     two fields that say what this app serves (TASK-089.17, G5) - the source
-    tree it runs from and the library it opened. Pinned as a whole so that a
-    field cannot appear or go without this line moving."""
+    tree it runs from and the library it opened - and the two pids
+    `MyScribe --stop` waits for and ends (TASK-112.03). Pinned as a whole so
+    that a field cannot appear or go without this line moving."""
+    monkeypatch.delenv("MYSCRIBE_LAUNCHER", raising=False)
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json() == {
@@ -54,7 +57,14 @@ def test_health_ok_with_version(client):
         "version": scribe.__version__,
         "app_dir": str(env.REPO_DIR),
         "data_dir": str(paths.DATA_DIR),
+        "pid": os.getpid(),
+        "launcher_pid": None,
     }
+
+
+def test_health_names_the_launcher_only_under_one(client, monkeypatch):
+    monkeypatch.setenv("MYSCRIBE_LAUNCHER", "MyScribe.exe")
+    assert client.get("/health").json()["launcher_pid"] == os.getppid()
 
 
 # --- GET /api/jobs ------------------------------------------------------------
@@ -298,3 +308,93 @@ def test_the_version_is_the_same_number_in_both_places():
     # X.Y.Z, or X.Y.Z with a PEP 440 pre-release for a beta (0.8.0b1, TASK-100):
     # packaging/release_kind.py publishes that as a GitHub pre-release.
     assert re.fullmatch(r"\d+\.\d+\.\d+((a|b|rc)\d+)?", scribe.__version__), scribe.__version__
+
+
+# --- the stop route (TASK-112.03, ADR-028) ---------------------------------------
+
+
+class _RecordingSupervisor:
+    """Stands in for the supervisor, so the route is tested without a runner."""
+
+    made: list = []
+
+    def __init__(self, db_path, *args, **kwargs):
+        self.stops: list[bool] = []
+        _RecordingSupervisor.made.append(self)
+
+    def start(self):
+        pass
+
+    def stop(self, timeout: float = 10.0, requeue: bool = False):
+        self.stops.append(requeue)
+
+
+@pytest.fixture
+def stoppable(db_path, monkeypatch):
+    """An app with a supervisor and a `request_exit` that records the ask."""
+    from scribe import supervisor as supervisor_module
+
+    _RecordingSupervisor.made = []
+    monkeypatch.setattr(supervisor_module, "Supervisor", _RecordingSupervisor)
+    app = create_app(db_path=db_path, start_supervisor=True, start_watcher=False)
+    asked: list[bool] = []
+    app.state.request_exit = lambda: asked.append(True)
+    return app, asked
+
+
+def _loopback(app, host="127.0.0.1"):
+    return TestClient(app, base_url="http://127.0.0.1", client=(host, 50123))
+
+
+def test_the_stop_route_asks_the_server_to_exit_and_requeues_at_shutdown(stoppable):
+    app, asked = stoppable
+    with _loopback(app) as client:
+        response = client.post("/api/shutdown")
+        assert response.status_code == 202
+        assert response.json()["pid"] == os.getpid()
+        assert asked == [True]
+
+    assert _RecordingSupervisor.made[0].stops == [True]
+
+
+def test_a_shutdown_nobody_asked_for_does_not_requeue(stoppable):
+    app, _asked = stoppable
+    with _loopback(app):
+        pass
+
+    assert _RecordingSupervisor.made[0].stops == [False]
+
+
+def test_the_stop_route_names_the_job_that_will_start_over(stoppable, conn):
+    app, _asked = stoppable
+    job_id = jobs.enqueue(conn, "transcribe")
+    conn.execute("UPDATE job SET status='running', started_at=1 WHERE id=?", (job_id,))
+    conn.commit()
+    with _loopback(app) as client:
+        assert client.post("/api/shutdown").json()["running_job"] == job_id
+
+
+@pytest.mark.parametrize("headers", [
+    {"Sec-Fetch-Site": "cross-site"},
+    {"Origin": "http://evil.example"},
+], ids=["cross-site", "foreign-origin"])
+def test_a_stop_from_another_site_is_refused(stoppable, headers):
+    """scribe.guard refuses it before the route runs: a page anywhere on the
+    web must not be able to switch somebody's MyScribe off."""
+    app, asked = stoppable
+    with _loopback(app) as client:
+        assert client.post("/api/shutdown", headers=headers).status_code == 403
+    assert asked == []
+
+
+def test_a_stop_from_another_machine_is_refused(stoppable):
+    app, asked = stoppable
+    with _loopback(app, host="192.168.1.5") as client:
+        assert client.post("/api/shutdown").status_code == 403
+    assert asked == []
+
+
+def test_health_names_the_process_that_serves(client):
+    """`MyScribe --stop` needs a pid to wait for: uvicorn closes the listener
+    before the lifespan ends, so a silent port is not yet a stopped app."""
+    assert client.get("/health").json()["pid"] == os.getpid()

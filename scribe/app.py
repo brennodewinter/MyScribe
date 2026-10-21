@@ -41,6 +41,7 @@ otherwise.
 """
 
 import json
+import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -51,6 +52,7 @@ from starlette.concurrency import run_in_threadpool
 
 import scribe
 from scribe import applog, autostart, db, env, fsbrowse, guard, jobs, media, paths, supervisor, web
+from scribe import shutdown as shutdown_module
 from scribe.ingest import feeds, recording, watching
 from scribe.options import OPTION_FIELDS, PARAM_KEYS, parse_options, replayable
 from scribe.stages import finalize, probe, transcribe, url_stage
@@ -309,7 +311,7 @@ def create_app(
             if watcher is not None:
                 watcher.stop()
             if sup is not None:
-                sup.stop()
+                sup.stop(requeue=bool(getattr(app.state, "stop_requested", False)))
             conn.close()
             applog.log("app.stop")
 
@@ -329,7 +331,26 @@ def create_app(
             "version": scribe.__version__,
             "app_dir": str(env.REPO_DIR),
             "data_dir": str(paths.DATA_DIR),
+            # `MyScribe --stop` waits for this pid, not for the port: uvicorn
+            # closes its listener before the lifespan has ended the runner.
+            # The launcher's own pid is what its hard stop ends, so that a
+            # supervisor sees the launcher's clean 0 and not a crash
+            # (TASK-112.03).
+            "pid": os.getpid(),
+            "launcher_pid": os.getppid() if os.environ.get(autostart.LAUNCHER_VARIABLE) else None,
         }
+
+    @app.post("/api/shutdown", status_code=202)
+    def shutdown(request: Request) -> dict:
+        """Stop this server the way a Quit should (TASK-112.03, ADR-028).
+
+        The running job is ended and put back at the front of the queue by the
+        lifespan's supervisor stop; the queued ones wait for the next start.
+        A page on another site is refused by `scribe.guard` before this runs.
+        The app binds 127.0.0.1 only, so the client check below is the second
+        lock on the same door, not the first.
+        """
+        return shutdown_module.stop_requested(request)
 
     @app.post("/api/media", status_code=201)
     async def add_media(request: Request) -> dict:

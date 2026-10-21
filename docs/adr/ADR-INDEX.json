@@ -1711,6 +1711,63 @@
         "supersedes": [],
         "superseded_by": null
       }
+    },
+    {
+      "id": "ADR-028",
+      "title": "A deliberate stop puts the running job back at the front of the queue",
+      "path": "ADR-028-a-deliberate-stop-puts-the-running-job-back-at-the-front-of-the-queue.md",
+      "format": "madr",
+      "status": "Accepted",
+      "date": "2026-10-21",
+      "decision_summary": "Chosen option: A, decided by Robert on 2026-10-21.",
+      "topics": [
+        "background",
+        "jobs",
+        "shutdown"
+      ],
+      "aliases": [
+        "requeue on stop",
+        "shutdown route",
+        "stop MyScribe",
+        "stop route"
+      ],
+      "components": [
+        "scribe.jobs",
+        "scribe.supervisor"
+      ],
+      "symbols": [
+        "requeue_running",
+        "Supervisor.stop"
+      ],
+      "context_scope": "selective",
+      "decision_contract": {
+        "must": [
+          "The stop route makes the supervisor end the runner's process tree, wait for it, and only then put the row back to queued at the front of its priority, with startedat, pid, stage and stageprogress cleared.",
+          "A row whose cancel was requested before the stop becomes cancelled, not queued.",
+          "The UI's Stop action says that the running job starts over at the next start."
+        ],
+        "must_not": [
+          "Requeue a row while its runner can still write to it.",
+          "Requeue after a crash, a hard kill or a reboot: those still go through reconcile() to interrupted (ADR-001)."
+        ],
+        "exceptions": [
+          "The hard-stop fallback of --stop, used when the route does not finish in time, ends the process tree: that job becomes interrupted, and --stop says so."
+        ],
+        "verification": [
+          "tests/testsupervisor.py and tests/testapp.py tests of TASK-112.03."
+        ]
+      },
+      "scope": {
+        "path_globs": []
+      },
+      "metadata": {
+        "binding": false,
+        "gate": null,
+        "documents_shipped": false,
+        "verified_in": [],
+        "supersedes": [],
+        "superseded_by": null
+      }
     }
   ],
   "relationships": [
@@ -2257,6 +2314,24 @@
     {
       "source": "ADR-027",
       "target": "ADR-012",
+      "type": "related",
+      "resolved": true
+    },
+    {
+      "source": "ADR-028",
+      "target": "ADR-001",
+      "type": "related",
+      "resolved": true
+    },
+    {
+      "source": "ADR-028",
+      "target": "ADR-013",
+      "type": "related",
+      "resolved": true
+    },
+    {
+      "source": "ADR-028",
+      "target": "ADR-026",
       "type": "related",
       "resolved": true
     }

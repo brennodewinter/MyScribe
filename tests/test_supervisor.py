@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -642,3 +643,66 @@ def test_a_job_nobody_cancelled_is_still_interrupted(conn):
     supervisor.reconcile(conn)
 
     assert _row(conn, job_id)["status"] == "interrupted"
+
+
+# --- a deliberate stop (TASK-112.03, ADR-028) -----------------------------------
+
+
+def _running_with_pid(conn, job_id):
+    assert _wait_for(
+        lambda: (r := _row(conn, job_id))["status"] == "running" and r["pid"] is not None
+    ), "runner never spawned"
+    return _row(conn, job_id)["pid"]
+
+
+def test_a_deliberate_stop_ends_the_runner_and_puts_its_job_at_the_front(
+    conn, db_path, sleeping_runner_cmd
+):
+    """ADR-028: stop now, lose nothing. The runner goes first, so the row can
+    never be queued while a child still holds the card."""
+    first = jobs.enqueue(conn, "fake", priority=5)
+    sup = supervisor.Supervisor(db_path, poll_interval=0.05, runner_cmd=sleeping_runner_cmd)
+    sup.start()
+    try:
+        pid = _running_with_pid(conn, first)
+        waiting = jobs.enqueue(conn, "fake", priority=5)
+    finally:
+        sup.stop(requeue=True)
+
+    row = _row(conn, first)
+    assert not supervisor.pid_alive(pid), "the runner outlived the stop"
+    assert row["status"] == "queued" and row["priority"] == 5
+    assert row["pid"] is None and row["started_at"] is None and row["stage"] is None
+    assert jobs.claim_next(conn)["id"] == first, f"job {waiting} was put ahead of the stopped one"
+
+
+def test_a_stop_nobody_asked_for_leaves_the_job_to_reconcile(conn, db_path, sleeping_runner_cmd):
+    """A crash, a hard kill or a Ctrl+C still ends `interrupted` through
+    reconcile (ADR-001); only the stop route requeues."""
+    job_id = jobs.enqueue(conn, "fake")
+    sup = supervisor.Supervisor(db_path, poll_interval=0.05, runner_cmd=sleeping_runner_cmd)
+    sup.start()
+    pid = _running_with_pid(conn, job_id)
+    sup.stop()
+    try:
+        assert _row(conn, job_id)["status"] == "running"
+        assert supervisor.pid_alive(pid)
+    finally:
+        os.kill(pid, signal.SIGTERM)
+
+
+def test_a_job_cancelled_before_the_stop_is_cancelled_not_requeued(
+    conn, db_path, sleeping_runner_cmd
+):
+    job_id = jobs.enqueue(conn, "fake")
+    sup = supervisor.Supervisor(
+        db_path, poll_interval=0.05, runner_cmd=sleeping_runner_cmd, kill_grace=60.0
+    )
+    sup.start()
+    try:
+        _running_with_pid(conn, job_id)
+        jobs.request_cancel(conn, job_id)
+    finally:
+        sup.stop(requeue=True)
+
+    assert _row(conn, job_id)["status"] == "cancelled"

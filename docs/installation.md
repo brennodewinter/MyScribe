@@ -165,6 +165,24 @@ What a clone uses, per platform:
 | ffmpeg | fetched, or `winget install Gyan.FFmpeg` | fetched, or `apt install ffmpeg` | `brew install ffmpeg` |
 | Optional | `yt-dlp` for links, `node` for the recorder tests | same | same |
 
+## Stopping MyScribe
+
+Started at login, MyScribe runs without a window. Stop it from Settings >
+*Start at login* > **Stop MyScribe**, or from a terminal:
+
+- Windows: `"%LOCALAPPDATA%\Programs\MyScribe\MyScribe.exe" --stop`
+- macOS: `/Applications/MyScribe.app/Contents/MacOS/MyScribe --stop`
+- Linux: `./MyScribe-<version>-linux-x64.AppImage --stop`
+- A clone: `.venv/Scripts/python packaging/launcher/myscribe_launcher.py --stop`
+  (`.venv/bin/python` on Linux and macOS)
+
+A job that is running goes back to the front of the queue and starts over the
+next time MyScribe starts; queued jobs wait for that start. If MyScribe has
+not stopped within a minute, `--stop` ends it, and that job is then marked
+*interrupted*: Retry on the jobs page starts it over. On Windows `--stop`
+prints nothing; what it did is in `MyScribe-launcher.log` beside
+`MyScribe.location`.
+
 ## Updating
 
 **A release:** download the new file and install it over the old one. Your

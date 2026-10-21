@@ -1097,3 +1097,43 @@ def test_every_choose_a_provider_link_opens_the_providers_card(client):
     for link in links:
         page = client.get(link.split("#")[0]).text
         assert re.search(r'id="ss-llm"[^>]*\schecked', page), link
+
+
+# --- Stop MyScribe (TASK-112.03, ADR-028) ----------------------------------------
+
+
+@pytest.fixture
+def stoppable_client(db_path, data_dir):
+    """The settings page of an app that can stop itself, from loopback, with
+    the ask recorded instead of uvicorn's exit."""
+    app = create_app(db_path=db_path, start_supervisor=False)
+    asked: list[bool] = []
+    app.state.request_exit = lambda: asked.append(True)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50123)) as client:
+        client.asked = asked
+        yield client
+
+
+def test_the_stop_card_says_what_happens_to_a_running_job(client):
+    page = client.get("/settings").text
+    assert 'id="stop-myscribe"' in page
+    assert "goes back to the front of the queue and starts over" in page
+    assert 'hx-post="/settings/stop"' in page
+
+
+def test_the_stop_button_stops_and_names_the_job_that_starts_over(stoppable_client, conn):
+    job_id = jobs.enqueue(conn, "transcribe")
+    conn.execute("UPDATE job SET status='running', started_at=1 WHERE id=?", (job_id,))
+    conn.commit()
+
+    response = stoppable_client.post("/settings/stop", headers=HX)
+
+    assert response.status_code == 200 and stoppable_client.asked == [True]
+    assert f"Job {job_id} was running" in response.text
+    assert "starts over the next time MyScribe starts" in response.text
+    assert "Start MyScribe again" in response.text
+
+
+def test_the_stop_button_from_another_site_is_refused(stoppable_client):
+    response = stoppable_client.post("/settings/stop", headers={**HX, "Sec-Fetch-Site": "cross-site"})
+    assert response.status_code == 403 and stoppable_client.asked == []
