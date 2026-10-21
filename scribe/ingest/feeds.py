@@ -794,10 +794,7 @@ class FeedWatcher:
             worker.start()
             worker.join(PROBE_TIMEOUT_SECONDS)
             if worker.is_alive():
-                raise TimeoutError(
-                    f"did not answer within {PROBE_TIMEOUT_SECONDS:g} s; tried again"
-                    " at the next check"
-                )
+                raise TimeoutError(f"did not answer within {PROBE_TIMEOUT_SECONDS:g} s")
             return outcome.result()
 
         return bounded
