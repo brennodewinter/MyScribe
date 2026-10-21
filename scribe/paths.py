@@ -72,7 +72,7 @@ def refresh() -> None:
 
 
 def ensure_dirs() -> None:
-    """Create the library's folders and keep DATA_DIR closed to other accounts.
+    """Create the library's folders and keep DATA_DIR to its owner and group.
 
     A DATA_DIR this call creates is 0700. An existing one loses its bits for
     "other" at every start, and on macOS also its group bits while its group
