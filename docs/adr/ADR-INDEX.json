@@ -1717,7 +1717,7 @@
       "title": "A deliberate stop puts the running job back at the front of the queue",
       "path": "ADR-028-a-deliberate-stop-puts-the-running-job-back-at-the-front-of-the-queue.md",
       "format": "madr",
-      "status": "Proposed",
+      "status": "Accepted",
       "date": "2026-10-21",
       "decision_summary": "Chosen option: A, decided by Robert on 2026-10-21.",
       "topics": [

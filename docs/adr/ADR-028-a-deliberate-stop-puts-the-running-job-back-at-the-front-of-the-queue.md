@@ -1,7 +1,7 @@
 ---
 id: "ADR-028"
 title: "A deliberate stop puts the running job back at the front of the queue"
-status: "Proposed"
+status: "Accepted"
 date: "2026-10-21"
 binding: false
 gate: null
@@ -9,7 +9,6 @@ documents_shipped: false
 verified_in: []
 supersedes: []
 superseded_by: null
-format: "madr"
 topics:
   - "jobs"
   - "shutdown"
@@ -26,6 +25,7 @@ symbols:
   - "Supervisor.stop"
   - "requeue_running"
 context_scope: "selective"
+format: "madr"
 ---
 
 <!-- markdownlint-disable MD025 -->
@@ -34,7 +34,7 @@ context_scope: "selective"
 
 ## Status
 
-Proposed, 2026-10-21.
+Accepted, 2026-10-21.
 
 ## Status History
 
@@ -45,6 +45,11 @@ status_history:
     changed_by: Claude (agent, session 2026-10-21)
     reason: Initial proposal
     changed_via: adr-kit
+  - date: 2026-10-21
+    status: Accepted
+    changed_by: "User: Robert van den Breemen"
+    reason: "Robert accepted the text of PR #27 in an interactive session on 2026-10-21"
+    changed_via: adr-kit lifecycle
 ```
 
 ## Context and Problem Statement
@@ -141,7 +146,7 @@ priority kept.
 * The work done before the stop is redone: up to a whole transcription.
 * Only the stop route requeues. Window Quit, Ctrl+C and a SIGTERM still
   behave as today: `interrupted` on Windows, an orphaned runner that runs on
-  elsewhere. Mitigation: the open question below.
+  elsewhere. Mitigation: TASK-112.09 sends them through the stop route too.
 
 ## Pros and Cons of the Options
 
@@ -168,7 +173,7 @@ priority kept.
 ## Open Questions
 
 - [x] What does a stop do to a running job? — **Answered 2026-10-21 by User: Robert van den Breemen:** it goes back to the queue (option A).
-- [ ] Should window Quit, Ctrl+C and a SIGTERM to the launcher go through the stop route too, so they requeue on every OS and no runner outlives the app on macOS and Linux?
+- [x] Should window Quit, Ctrl+C and a SIGTERM to the launcher go through the stop route too, so they requeue on every OS and no runner outlives the app on macOS and Linux? — **Answered 2026-10-21 by User: Robert van den Breemen:** Yes: they go through the stop route too, as follow-up TASK-112.09, so every stop requeues on every OS and no runner outlives the app on macOS and Linux.
 
 ## Related Decisions
 
