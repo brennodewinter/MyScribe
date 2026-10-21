@@ -436,29 +436,73 @@ def test_a_feed_still_hung_from_last_time_is_skipped_not_probed_again(conn, monk
         assert done.wait(10.0), "the second tick never came back"
 
         assert calls == [HUNG_URL]
-        assert hung_id in {f["id"] for f in feeds.due_feeds(conn)}
+        # Recorded as a failure for this due time, so not due again at once:
+        # left due and unrecorded, it never reached MAX_FAILURES_REPORTED.
+        assert hung_id not in {f["id"] for f in feeds.due_feeds(conn)}
     finally:
         release.set()
         for helper in helpers:
             helper.join(10.0)
 
 
-def test_a_poll_asks_for_a_bounded_listing_not_the_whole_archive(conn):
-    """limit=None had yt-dlp page through every entry a channel has, and then
-    `known_sources` bound two SQL variables per entry: past 16383 entries that
-    is SQLite's "too many SQL variables" (limit 32766), raised outside the
-    probe's try, so the feed was never recorded and stayed due for ever. A
-    poll only needs the top of the listing, and asks for that."""
-    feed_id = feeds.subscribe(conn, FEED_URL, answered=True)
-    asked = []
+def test_a_feed_that_stays_hung_counts_once_per_due_time_until_it_shows_as_failing(
+    conn, monkeypatch
+):
+    """GitHub #36: a skip because the last probe still runs is that due time's
+    failure. Left due and unrecorded, the counter stopped at the first timeout
+    and the Feeds page said "trying again" for ever about a feed that never
+    came back. Counted once per due time, not once per five-minute wake."""
+    import threading
 
-    def probe(url, **kwargs):
-        asked.append(kwargs.get("limit"))
-        return playlist(entry(1))
+    monkeypatch.setattr(feeds, "PROBE_TIMEOUT_SECONDS", 0.3, raising=False)
+    hung_id = feeds.subscribe(conn, HUNG_URL, answered=True)
+    release, calls = threading.Event(), []
+    watcher = feeds.FeedWatcher("never-opened.db", probe=_hanging_on(HUNG_URL, release, calls))
+    helpers = []
 
-    feeds.poll(
+    def tick():
+        helper, done = _tick_in_background(watcher, conn)
+        helpers.append(helper)
+        assert done.wait(10.0), "the tick never came back"
+
+    try:
+        tick()
+        assert _feed(conn, hung_id)["failures"] == 1
+        for expected in range(2, feeds.MAX_FAILURES_REPORTED + 1):
+            conn.execute("UPDATE feed SET checked_at=NULL WHERE id=?", (hung_id,))
+            conn.commit()
+            tick()
+            assert _feed(conn, hung_id)["failures"] == expected
+
+        tick()  # another wake inside the same due time
+
+        hung = _feed(conn, hung_id)
+        assert hung["failures"] == feeds.MAX_FAILURES_REPORTED
+        assert "did not answer" in hung["last_result"]
+        assert calls == [HUNG_URL]
+    finally:
+        release.set()
+        for helper in helpers:
+            helper.join(10.0)
+
+
+def test_an_oldest_first_source_still_has_its_newest_entry_found(conn):
+    """GitHub #36: a poll asks for the whole listing. A cap (`playlistend`)
+    assumed every source lists newest first; for one that lists oldest first
+    it kept the oldest entries and the new one at the bottom was never seen
+    again. `new_entries` is a set difference and does not care about order,
+    so the listing it is handed must not either."""
+    old = [entry(n) for n in range(1, 602)]  # more than the 500 the cap was
+    feed_id = feeds.subscribe(conn, FEED_URL, entries=old, answered=True)
+    listing = old + [entry(602)]  # oldest first: the new one comes last
+
+    def probe(url, *, limit=None, **kwargs):
+        # yt-dlp's `playlistend`: the first `limit` entries in document order.
+        return playlist(*(listing if limit is None else listing[:limit]))
+
+    out = feeds.poll(
         conn, _feed(conn, feed_id), probe=probe, known_sources=nothing_known, options=OPTIONS
     )
 
-    assert len(asked) == 1 and asked[0] is not None
-    assert feeds.MAX_NEW_PER_POLL < asked[0] <= 16383
+    assert out["new"] == 1
+    assert [p[url_stage.ENTRY_KEY]["source_id"] for p in _queued(conn)] == ["Generic:g602"]

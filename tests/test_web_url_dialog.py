@@ -1248,6 +1248,28 @@ def test_known_sources_matches_on_the_id_when_the_url_differs(conn, tmp_path, da
     assert states == ["library", None]
 
 
+def test_known_sources_answers_a_listing_past_sqlites_variable_limit(conn, tmp_path, data_dir):
+    """GitHub #36: a feed poll lists the whole source, and two bound
+    parameters per entry in one statement passed SQLite's limit (32766) past
+    16383 entries - "too many SQL variables", raised outside the probe's try,
+    so the feed was never recorded and stayed due on every wake."""
+    import sqlite3
+
+    count = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) // 2 + 1
+    listing = [
+        {"url": f"https://example.test/watch?v=big{i}", "source_id": f"Youtube:big{i}"}
+        for i in range(count)
+    ]
+    _seed_media(conn, tmp_path, "a.mp3", source_url=listing[-1]["url"])
+    _seed_media(conn, tmp_path, "b.mp3", source_id=listing[0]["source_id"])
+
+    states = feeds.known_sources(conn, listing)
+
+    assert len(states) == count
+    assert states[0] == "library" and states[-1] == "library"
+    assert set(states[1:-1]) == {None}
+
+
 def test_the_header_says_the_first_n_when_the_listing_was_cut(client, monkeypatch):
     monkeypatch.setattr(ingest_ui, "MAX_LISTED", 3)
     info = playlist_info(3)

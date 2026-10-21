@@ -57,22 +57,6 @@ podcast and several months of a weekly one, so a feed that genuinely raced
 ahead still catches up over a few polls, while a feed that broke its own
 identity stops at something a person can look at and undo."""
 
-POLL_LISTING_LIMIT = 20 * MAX_NEW_PER_POLL
-"""How many entries a poll asks the probe for (`playlistend`), newest first.
-
-A poll only has to see what appeared since the last check, plus whatever a
-capped poll left for the next one; both sit at the top of the listing.
-Twenty polls' worth is 500: a daily podcast left unchecked for over a year
-still catches up, 25 a check. GitHub #36: it was `limit=None`, which had
-yt-dlp page through every entry of a channel with hundreds of thousands, and
-then `known_sources` bound two SQL variables per entry - past 16383 entries
-SQLite's "too many SQL variables" (32766), raised outside the probe's
-`try`, so the feed was never recorded and stayed due on every wake. For a
-paginated channel this bounds the work; an RSS feed is one document read
-whole, so there it bounds only the answer, and `PROBE_TIMEOUT_SECONDS` is
-what bounds the time. `backfill`'s "everything" still asks for all: that is
-a person's explicit request, capped by `url_stage.MAX_FAN_OUT`."""
-
 DEFAULT_INTERVAL_SECONDS = 86400
 """A day. Robert asked for daily or at startup, and due-dates give both."""
 
@@ -482,8 +466,13 @@ def poll(
         stored = prefix + exc.fitted(200 - len(prefix))
         _record(conn, feed_id, result=stored[:200], failed=True, now=stamp)
         return {"queued": [], "new": 0, "error": result}
+    # The whole listing, not the top of it (GitHub #36). `new_entries` is a
+    # set difference and finds the new episode wherever it sits; a cap
+    # (`playlistend`) would keep the first entries in document order, and a
+    # source that lists oldest first would never show its new ones again.
+    # What bounds a huge listing is the watcher's `PROBE_TIMEOUT_SECONDS`.
     try:
-        info = probe(feed["url"], limit=POLL_LISTING_LIMIT)
+        info = probe(feed["url"], limit=None)
     except Exception as exc:  # noqa: BLE001 - any failure is the feed's failure
         result = f"{type(exc).__name__}: {exc}"
         _record(conn, feed_id, result=result[:200], failed=True, now=stamp)
@@ -572,7 +561,7 @@ stopped. Three minutes is a few slow feeds' worth, and comfortably inside the
 five-minute wake.
 """
 
-PROBE_TIMEOUT_SECONDS = 60.0
+PROBE_TIMEOUT_SECONDS = 150.0
 """How long the watcher waits for one feed's probe before giving up on it.
 
 GitHub #36. `urls.SOCKET_TIMEOUT` bounds one socket read, not the probe: a
@@ -580,9 +569,16 @@ host that drips a byte every few seconds never trips it, and a listing that
 keeps answering runs as long as it has entries. So the probe runs on a
 worker thread and the tick waits this long; past it the feed is recorded as
 failed, like a probe that raised, and the tick goes on to the next feed.
-`POLL_LISTING_LIMIT` entries of a channel take about 12 s at the measured 40
-a second, so a minute is five times a healthy poll, and the same minute the
-dialog's patient preview gives a listing (`ingest_ui.PATIENT_TIMEOUT_SECONDS`).
+
+Sized for the whole listing a poll asks for. A feed is one document, read in
+seconds even at a few thousand episodes. A channel is paged, at the 40 entries
+a second measured in `urls.probe_opts` (2026-09-08): 3000 entries take about
+75 s, so two and a half minutes is twice that, and a listing of up to about
+6000 entries still answers. A larger channel is recorded as not answering
+rather than followed. A dripping host costs at most this once per due time,
+since a feed whose worker still runs is skipped. The budget is looked at
+between feeds, so the longest tick is `TICK_BUDGET_SECONDS` plus this, about
+five and a half minutes; the next wake then waits its interval from there.
 Read at call time: the tests patch it.
 """
 
@@ -610,6 +606,12 @@ def _job_params(text: str | None) -> dict:
     return params if isinstance(params, dict) else {}
 
 
+_KEYS_PER_STATEMENT = 5000
+"""Bound parameters per `known_sources` media query: well under SQLite's
+32766 (>= 3.35, asserted in `db.connect`), and a dialog listing of
+`ingest_ui.MAX_LISTED` entries is still one statement per column (GitHub #36)."""
+
+
 def known_sources(conn: sqlite3.Connection, entries: list[dict]) -> list[str | None]:
     """One state per listed entry: "queued", "library", "trash" or None.
 
@@ -621,10 +623,12 @@ def known_sources(conn: sqlite3.Connection, entries: list[dict]) -> list[str | N
     is named as such rather than hidden, because re-importing it would dedupe
     onto the trashed row and the finished transcript would be invisible.
 
-    One statement for the media side: at most two parameters per entry, so
-    5000 at `MAX_LISTED`, well under the 32766 that SQLite >= 3.35 (asserted
-    in `db.connect`) allows. Under `db.LOCK`, like every read in this process
-    (ADR-002).
+    The media side is asked in chunks of `_KEYS_PER_STATEMENT` keys. One
+    statement for the whole listing bound two parameters per entry, and a
+    feed poll lists the whole source: past 16383 entries that was SQLite's
+    "too many SQL variables" (32766), raised outside the probe's `try`, so the
+    feed was never recorded and stayed due on every wake (GitHub #36). Under
+    `db.LOCK`, like every read in this process (ADR-002).
 
     Lives here rather than in `scribe.web.ingest_ui`, where it was born: the
     feed watcher asks the same question on a thread that may not import
@@ -638,23 +642,21 @@ def known_sources(conn: sqlite3.Connection, entries: list[dict]) -> list[str | N
     by_id: dict[str, str] = {}
 
     with db.LOCK:
-        if wanted_urls or wanted_ids:
-            clauses, params = [], []
-            if wanted_urls:
-                clauses.append(f"source_url IN ({','.join('?' * len(wanted_urls))})")
-                params.extend(wanted_urls)
-            if wanted_ids:
-                clauses.append(f"source_id IN ({','.join('?' * len(wanted_ids))})")
-                params.extend(wanted_ids)
-            rows = conn.execute(
-                "SELECT source_url, source_id, trashed_at FROM media WHERE " + " OR ".join(clauses),
-                params,
-            ).fetchall()
-            for row in rows:
-                state = "library" if row["trashed_at"] is None else "trash"
-                for key, table in ((row["source_url"], by_url), (row["source_id"], by_id)):
-                    if key and table.get(key) != "library":
-                        table[key] = state
+        for column, wanted in (("source_url", wanted_urls), ("source_id", wanted_ids)):
+            for start in range(0, len(wanted), _KEYS_PER_STATEMENT):
+                chunk = wanted[start : start + _KEYS_PER_STATEMENT]
+                rows = conn.execute(
+                    "SELECT source_url, source_id, trashed_at FROM media"
+                    f" WHERE {column} IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                ).fetchall()
+                # A row can come back from more than one chunk; "library"
+                # winning over "trash" makes that harmless.
+                for row in rows:
+                    state = "library" if row["trashed_at"] is None else "trash"
+                    for key, table in ((row["source_url"], by_url), (row["source_id"], by_id)):
+                        if key and table.get(key) != "library":
+                            table[key] = state
         live = conn.execute(
             "SELECT params_json FROM job WHERE type=? AND status IN ('queued', 'running')",
             (url_stage.JOB_TYPE,),
@@ -693,6 +695,18 @@ def _poll_one(
     variable is the classic way to check every feed against the last one.
     """
     return poll(conn, feed, probe=probe, known_sources=known_sources, options=options)
+
+
+def _still_running(conn: sqlite3.Connection, feed_id: int) -> None:
+    """Record a due feed whose previous probe has not come back as failed."""
+    _record(
+        conn,
+        feed_id,
+        result=f"did not answer: the check given up on after {PROBE_TIMEOUT_SECONDS:g} s"
+        " is still running",
+        failed=True,
+        now=time.time(),
+    )
 
 
 class FeedWatcher:
@@ -775,8 +789,9 @@ class FeedWatcher:
         child cannot unpickle), a child would pay an interpreter start and a
         yt-dlp import per feed, and `UrlInfo` would have to cross back pickled.
         What a thread cannot be is stopped, so it is remembered in `_probing`
-        and its feed is skipped while it lives - at most one stuck thread per
-        feed, and `urls.SOCKET_TIMEOUT` still ends one whose host goes silent.
+        and its feed is skipped, and recorded as failing, while it lives - at
+        most one stuck thread per feed, and `urls.SOCKET_TIMEOUT` still ends
+        one whose host goes silent.
         The same trade `ingest_ui.probe_or_none` makes for the dialog.
         """
 
@@ -823,10 +838,14 @@ class FeedWatcher:
             feed_id = int(feed["id"])
             previous = self._probing.get(feed_id)
             if previous is not None and previous.is_alive():
-                # Its last probe was given up on and is still running. Left
-                # due and unrecorded rather than probed a second time: the
-                # timeout already counted as its failure, and another thread
-                # every wake is how hung workers would pile up (GitHub #36).
+                # Its last probe was given up on and is still running. Not
+                # probed a second time - another thread every wake is how
+                # hung workers would pile up - but recorded as this due
+                # time's failure: left due and unrecorded, the counter never
+                # reached MAX_FAILURES_REPORTED and the Feeds page said
+                # "trying again" for ever. `checked_at` is stamped, so it
+                # counts once per due time, not once per wake (GitHub #36).
+                _survive(_still_running, conn, feed_id)
                 continue
             self._probing.pop(feed_id, None)
             # `poll` takes its collaborators by keyword, so the call is bound
