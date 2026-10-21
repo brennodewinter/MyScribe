@@ -253,7 +253,9 @@ def test_a_live_orphan_from_a_previous_life_holds_the_queue_until_it_ends(
     alone, the next life's reconcile keeps its row because the pid is alive,
     and the new supervisor claimed the next job beside it - two runners on one
     card. Now the claim waits for the row to leave running."""
-    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    # Shaped like a runner: `_spawn` starts each in a session of its own.
+    session = {} if sys.platform == "win32" else {"start_new_session": True}
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], **session)
     try:
         orphan = jobs.enqueue(conn, "fake")
         _left_running_by_a_previous_life(conn, orphan, live.pid)
@@ -394,7 +396,9 @@ def test_cancel_kills_hung_runner_within_grace_and_cancels_job(
 def test_reconcile_flips_dead_and_absent_pid_running_jobs(conn):
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
-    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    # Shaped like a runner: `_spawn` starts each in a session of its own (#32).
+    session = {} if sys.platform == "win32" else {"start_new_session": True}
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], **session)
     try:
         j_dead = jobs.enqueue(conn, "fake")
         j_absent = jobs.enqueue(conn, "fake")
@@ -724,3 +728,89 @@ def test_a_job_cancelled_before_the_stop_is_cancelled_not_requeued(
         sup.stop(requeue=True)
 
     assert _row(conn, job_id)["status"] == "cancelled"
+
+
+# --- a row no runner will ever answer for (GitHub #29, #32) ----------------------
+
+
+def _not_a_runner():
+    """A live process that is no runner of this app: on POSIX it shares this
+    test's session instead of leading one (`_spawn` starts every runner with
+    `start_new_session`), on Windows its image is cmd.exe and not python."""
+    if sys.platform == "win32":
+        return subprocess.Popen(["cmd.exe", "/c", "ping -n 60 127.0.0.1 >nul"],
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+
+def test_a_claim_whose_spawn_never_came_does_not_hold_the_queue_for_ever(conn):
+    """#29: claim_next writes running with no pid; the app died before the
+    pid was written. The claim-to-spawn gap is milliseconds, so a row still
+    without a pid a minute later has no writer left."""
+    job_id = jobs.enqueue(conn, "fake")
+    with db.LOCK:
+        conn.execute("UPDATE job SET status='running', pid=NULL, started_at=? WHERE id=?",
+                     (time.time() - 2 * supervisor._PID_AGE_SLACK_SECONDS, job_id))
+        conn.commit()
+
+    assert supervisor.reconcile(conn) == 1
+    assert _row(conn, job_id)["status"] == "interrupted"
+
+
+def test_a_stale_claim_lets_the_next_job_run(conn, db_path, ok_runner_cmd):
+    stale = jobs.enqueue(conn, "fake")
+    with db.LOCK:
+        conn.execute("UPDATE job SET status='running', pid=NULL, started_at=? WHERE id=?",
+                     (time.time() - 3600, stale))
+        conn.commit()
+    job_id = jobs.enqueue(conn, "fake")
+
+    sup = supervisor.Supervisor(db_path, poll_interval=0.05, runner_cmd=ok_runner_cmd)
+    sup.start()
+    try:
+        assert _wait_for(lambda: _row(conn, job_id)["status"] == "done"), "the stale claim held the queue"
+    finally:
+        sup.stop()
+
+
+def test_a_pid_reused_by_something_that_is_no_runner_does_not_keep_the_row(conn):
+    """#32: the pid is alive and the process is not younger than the job -
+    reused inside the minute of slack - but it is not a runner at all."""
+    stranger = _not_a_runner()
+    try:
+        job_id = jobs.enqueue(conn, "fake")
+        _left_running_by_a_previous_life(conn, job_id, stranger.pid)
+
+        supervisor.reconcile(conn)
+
+        assert _row(conn, job_id)["status"] == "interrupted"
+        assert stranger.poll() is None, "reconcile touched the stranger"
+    finally:
+        stranger.kill()
+        stranger.wait(10)
+
+
+def test_cancel_never_signals_a_process_that_is_no_runner():
+    """#32: kill_orphan used to take the stranger's whole process group."""
+    stranger = _not_a_runner()
+    try:
+        assert supervisor.kill_orphan(stranger.pid) is False
+        time.sleep(0.3)
+        assert stranger.poll() is None, "kill_orphan ended a process that was no runner"
+    finally:
+        stranger.kill()
+        stranger.wait(10)
+
+
+def test_a_runner_shaped_process_is_recognised(tmp_path):
+    """The other half: a real runner still counts, or a long transcription
+    would lose its row at the next restart."""
+    session = {} if sys.platform == "win32" else {"start_new_session": True}
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+    runner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              creationflags=flags, **session)
+    try:
+        assert supervisor.could_be_runner(runner.pid)
+    finally:
+        runner.kill()
+        runner.wait(10)

@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import textwrap
 from pathlib import Path
 
@@ -1123,7 +1124,8 @@ def test_the_stop_card_says_what_happens_to_a_running_job(client):
 
 def test_the_stop_button_stops_and_names_the_job_that_starts_over(stoppable_client, conn):
     job_id = jobs.enqueue(conn, "transcribe")
-    conn.execute("UPDATE job SET status='running', started_at=1 WHERE id=?", (job_id,))
+    conn.execute("UPDATE job SET status='running', started_at=? WHERE id=?",
+                 (time.time(), job_id))  # a fresh claim: an old one is reconciled away (#29)
     conn.commit()
 
     response = stoppable_client.post("/settings/stop", headers=HX)
