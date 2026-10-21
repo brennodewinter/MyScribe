@@ -8,6 +8,7 @@ user's source file.
 
 import hashlib
 import os
+import time
 
 import pytest
 
@@ -380,3 +381,44 @@ def test_a_deduped_arrival_without_a_source_changes_nothing(conn, data_dir, src_
 
     assert again["deduped"] is True
     assert (again["source_url"], again["source_id"]) == ("https://a.test/1.mp3", "Generic:g1")
+
+
+# --- the .part sweep ---------------------------------------------------------
+
+
+def test_sweep_parts_removes_abandoned_writes_but_not_live_ones(data_dir):
+    incoming = data_dir / "media" / ".incoming"
+    incoming.mkdir()
+    shard = data_dir / "media" / "ab"
+    shard.mkdir()
+    old = time.time() - 2 * media.PART_SWEEP_SECONDS
+    for path in (incoming / "old.part", shard / "old.part"):
+        path.write_bytes(b"x")
+        os.utime(path, (old, old))
+    fresh = incoming / "fresh.part"
+    fresh.write_bytes(b"y")
+    stored = shard / "stored.wav"
+    stored.write_bytes(b"z")
+    os.utime(stored, (old, old))
+
+    assert media.sweep_parts() == 2
+    assert fresh.exists(), "a part still being written is younger than the cutoff"
+    assert stored.exists(), "only .part files are litter"
+
+
+def test_sweep_parts_looks_only_where_parts_are_written(data_dir):
+    """One level down and no further (GitHub #39): `.incoming`, a shard and
+    `proxy` are every place this app writes a `.part`, and the sweep runs
+    hourly on the watcher's thread - a walk of whatever else lives under the
+    store is cost, and deleting from it is not this sweep's business."""
+    old = time.time() - 2 * media.PART_SWEEP_SECONDS
+    proxy_part = data_dir / "media" / media.PROXY_DIRNAME / "abc.m4a.1234abcd.part"
+    deeper = data_dir / "media" / "ab" / "somebody-elses" / "old.part"
+    for path in (proxy_part, deeper):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"x")
+        os.utime(path, (old, old))
+
+    assert media.sweep_parts() == 1
+    assert not proxy_part.exists(), "a transcode that died leaves its part in proxy/"
+    assert deeper.exists(), "nothing here writes two levels down"

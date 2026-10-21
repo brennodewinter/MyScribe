@@ -16,7 +16,8 @@
 # Exit codes, read by the [Code] section:
 #   0  nothing of this install was running
 #   10 something was running and has stopped
-#   1  something is still running
+#   1  something is still running, or this script failed (the reason is
+#      in the log)
 #
 # Windows PowerShell 5.1: no `??`, no -NoProxy. What it did goes to
 # MyScribe-launcher.log beside MyScribe.location, where the launcher writes
@@ -30,6 +31,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Whatever goes wrong unforeseen is said before the exit, so "1" in the
+# installer always has a line in the log behind it.
+trap {
+    Say "Stopping MyScribe failed: $($_.Exception.Message)"
+    exit 1
+}
 
 function Say([string]$text) {
     $line = '{0} setup: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $text
@@ -106,7 +114,11 @@ if ($launcher -and $health.pid) {
 $left = Get-Ours
 foreach ($process in $left) {
     Say "Ending $($process.Name) (process $($process.ProcessId)) and what it started."
-    & taskkill.exe /T /F /PID $process.ProcessId *> $null
+    # Through cmd, which swallows taskkill's stderr itself: Windows PowerShell
+    # 5.1 turns a native command's stderr into a terminating error under
+    # 'Stop', and taskkill says "not found" for a process its parent's tree
+    # kill already took - an exit 1 for a MyScribe that had stopped.
+    $null = & cmd.exe /c "taskkill /T /F /PID $($process.ProcessId) >nul 2>&1"
 }
 foreach ($process in $left) {
     if (-not (Wait-Gone ([int]$process.ProcessId) 15)) {

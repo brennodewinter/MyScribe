@@ -410,6 +410,12 @@ def _library_under_tmp_path(tmp_path, monkeypatch):
     library = tmp_path / "library"
     monkeypatch.setenv("SCRIBE_DATA_DIR", str(library))
     monkeypatch.setenv(env.PATH_VARIABLE, str(tmp_path / "no-such.env"))
+    # The "fake" job type is a test seam a shipped copy keeps closed
+    # (runner.FAKE_STAGES_VARIABLE): set it in the environment, like the two
+    # above, so a runner child spawned mid-test inherits it too.
+    from scribe import runner
+
+    monkeypatch.setenv(runner.FAKE_STAGES_VARIABLE, "1")
     monkeypatch.setattr(paths, "DATA_DIR", library)
     monkeypatch.setattr(paths, "DB_PATH", library / "myscribe.db")
     monkeypatch.setattr(paths, "MEDIA_DIR", library / "media")
