@@ -198,6 +198,64 @@ def _pid_is_younger_than_job(row) -> bool:
     return process_start > float(started_at) + _PID_AGE_SLACK_SECONDS
 
 
+def _image_name(pid: int) -> str | None:
+    """The file name of the executable behind a Windows pid, or None."""
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        size = ctypes.wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return None
+        return Path(buffer.value).name
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def could_be_runner(pid: int | None) -> bool:
+    """Is the process holding `pid` shaped like a runner this app spawns?
+
+    Only a no is an answer, as in `_pid_is_younger_than_job`: a question the
+    system will not answer keeps the row. A runner leads a session of its own
+    on POSIX (`_spawn` passes `start_new_session`), and on Windows it is this
+    app's own python. A pid the system handed to something else inside the
+    minute of slack - Windows reuses them quickly - is neither, and must
+    neither hold the queue nor have its process group signalled (GitHub #32).
+    """
+    if not pid or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        name = _image_name(int(pid))
+        return name is None or name.lower() == Path(sys.executable).name.lower()
+    try:  # pragma: no cover - POSIX
+        return os.getsid(int(pid)) == int(pid)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def runner_alive(row) -> bool:
+    """Is the runner of this running row still there to deliver a verdict?
+
+    A live pid that is shaped like a runner and did not start well after the
+    job. Asked by `reconcile` and by the cancel route alike, so the two
+    never disagree about a row.
+    """
+    return (pid_alive(row["pid"]) and could_be_runner(row["pid"])
+            and not _pid_is_younger_than_job(row))
+
+
+def claim_is_fresh(row) -> bool:
+    """A running row with no pid yet, claimed less than the slack ago: the
+    supervisor that claimed it is about to write the pid. Older than that,
+    nobody will (GitHub #29) - the claim-to-spawn gap is milliseconds."""
+    return (row["pid"] is None and row["started_at"] is not None
+            and time.time() - float(row["started_at"]) < _PID_AGE_SLACK_SECONDS)
+
+
 def is_zombie(pid: int | None) -> bool:
     """Has this pid exited without anyone collecting it?
 
@@ -240,8 +298,8 @@ def kill_orphan(pid: int | None) -> bool:
     is alive and older than the job. A cancel then flipped the row and the
     work carried on - jobs 127 and 129, 2026-09-19.
     """
-    if not pid_alive(pid):
-        return False
+    if not pid_alive(pid) or not could_be_runner(pid):
+        return False  # gone, or a reused pid: never signal a stranger (#32)
     pid = int(pid)
     try:
         if sys.platform == "win32":
@@ -338,14 +396,15 @@ def reconcile(conn) -> int:
         ).fetchall()
     count = 0
     for row in rows:
-        if row["pid"] is None and row["started_at"] is not None:
+        if claim_is_fresh(row):
             # Claimed, not yet spawned: the supervisor owns this row and will
             # write the pid in a moment. `claim_next` (jobs.py:135) is the only
             # thing that sets a job running, and it always stamps started_at -
             # so a running row with neither pid nor start time is not a job in
-            # that gap but a leftover, and keeps the old treatment.
+            # that gap but a leftover, and keeps the old treatment. A claim
+            # older than the slack has no writer left (GitHub #29).
             continue
-        if pid_alive(row["pid"]) and not _pid_is_younger_than_job(row):
+        if runner_alive(row):
             continue
         # A job somebody asked to stop, whose runner is now gone, was
         # cancelled - the process ending is the request being carried out, not
