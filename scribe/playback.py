@@ -115,6 +115,13 @@ class ProxyError(Exception):
     """ffmpeg could not make the proxy, or made one that is not the same audio."""
 
 
+class TranscodeTimedOut(ProxyError):
+    """ffmpeg ran past `_transcode_timeout` and was killed (GitHub #35).
+
+    Its own class because `ensure_proxy` remembers this refusal and not the
+    other ProxyErrors of `transcode`."""
+
+
 # --- the rule ----------------------------------------------------------------------------
 
 
@@ -252,6 +259,7 @@ def transcode(src: Path, dst: Path) -> None:
     recording, and no bound at all lets a stuck ffmpeg hold the request
     thread forever.
     """
+    limit = _transcode_timeout(src)
     try:
         proc = subprocess.run(
             [
@@ -265,12 +273,13 @@ def transcode(src: Path, dst: Path) -> None:
             ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            timeout=_transcode_timeout(src),
+            timeout=limit,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired:
-        raise ProxyError(
-            f"ffmpeg did not finish converting {src.name}; treating it as unreadable"
+        raise TranscodeTimedOut(
+            f"ffmpeg did not finish converting {src.name}: timed out after"
+            f" {limit:.0f} s; treating it as unreadable"
         ) from None
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip()[-STDERR_TAIL:]
@@ -329,9 +338,13 @@ def ensure_proxy(original: Path, proxy: Path) -> None:
     is content-addressed and never changes, so that refusal is a fact about
     the file and this ffmpeg, and the next caller - the audio route on every
     play of a container the browser cannot open - reads it instead of running
-    the transcode again. Only the duration refusal is kept: ffmpeg missing or
-    a full disk are not facts about the file and are tried again. The
-    backfill command is the retry; it forgets the refusal first.
+    the transcode again. A transcode that timed out is kept the same way
+    (GitHub #35): the bound is twice the audio's length, so a file that
+    stalls ffmpeg stalls it every time, and without the note every play - and
+    every GET queued on this lock behind the first - ran its own transcode
+    of up to four hours. Only those two are kept: ffmpeg missing or a full
+    disk are not facts about the file and are tried again. The backfill
+    command is the retry; it forgets the refusal first.
     """
     if proxy.is_file():
         return
@@ -344,7 +357,11 @@ def ensure_proxy(original: Path, proxy: Path) -> None:
         proxy.parent.mkdir(parents=True, exist_ok=True)
         tmp = proxy.with_name(f"{proxy.name}.{uuid.uuid4().hex[:8]}.part")
         try:
-            transcode(original, tmp)
+            try:
+                transcode(original, tmp)
+            except TranscodeTimedOut as exc:
+                refused.write_text(str(exc), encoding="utf-8")
+                raise
             wanted, got = probe_duration(original), probe_duration(tmp)
             if not durations_agree(wanted, got):
                 reason = (

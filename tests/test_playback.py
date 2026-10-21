@@ -423,3 +423,75 @@ def test_a_stuck_transcode_is_a_refusal_not_a_hang(data_dir, monkeypatch, tmp_pa
     with pytest.raises(playback.ProxyError, match="did not finish"):
         playback.transcode(original, tmp_path / "out.part")
     assert time.monotonic() - started < 10
+
+
+def _stuck_transcodes(monkeypatch) -> list:
+    """Every ffmpeg run becomes a sleeping child that the 0.5 s bound kills;
+    the list counts them. Only ffmpeg is counted: the patch is on the shared
+    subprocess module, so an ffprobe would land here too."""
+    monkeypatch.setattr(playback, "_transcode_timeout", lambda src: 0.5)
+    real_run = subprocess.run
+    calls = []
+
+    def stuck_ffmpeg(cmd, **kwargs):
+        if cmd[0] == "ffmpeg":
+            calls.append(cmd)
+            return real_run([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(playback.subprocess, "run", stuck_ffmpeg)
+    return calls
+
+
+def test_a_timed_out_transcode_is_remembered_as_a_refusal(data_dir, monkeypatch):
+    """GitHub #35: a file that stalls ffmpeg stalls it every time, so without
+    a note every play of it - and every GET queued on the proxy lock behind
+    the first - ran its own transcode of up to four hours. The timeout is
+    kept like the duration refusal, and says that it timed out."""
+    original = _original(data_dir, b"\x1aE\xdf\xa3", ".mkv")
+    proxy = media.proxy_path_for("abc")
+    calls = _stuck_transcodes(monkeypatch)
+
+    with pytest.raises(playback.ProxyError) as first:
+        playback.ensure_proxy(original, proxy)
+    with pytest.raises(playback.ProxyError) as second:
+        playback.ensure_proxy(original, proxy)
+
+    assert len(calls) == 1, "the second play ran the stalled transcode again"
+    assert str(second.value) == str(first.value)
+    assert "timed out" in str(first.value)
+    assert playback.refusal_path_for(proxy).is_file()
+    assert not proxy.exists()
+
+
+def test_a_proxy_made_elsewhere_wins_over_a_timeout_refusal(data_dir, monkeypatch):
+    """The pipeline's proxy stage runs in the runner child: when it lands a
+    proxy after this process gave up, the proxy is served, not the note."""
+    original = _original(data_dir, b"\x1aE\xdf\xa3", ".mkv")
+    proxy = media.proxy_path_for("abc")
+    calls = _stuck_transcodes(monkeypatch)
+    with pytest.raises(playback.ProxyError):
+        playback.ensure_proxy(original, proxy)
+
+    _proxy()  # the runner child's transcode finished
+    playback.ensure_proxy(original, proxy)
+
+    assert len(calls) == 1
+    assert playback.source(original, "abc") == playback.Source(proxy, "audio/mp4", exact=True)
+
+
+def test_the_backfill_is_the_retry_for_a_timeout_refusal(conn, data_dir, tmp_path, monkeypatch, capsys):
+    """`python -m scribe.proxies` forgets a timeout refusal like any other, so
+    a faster machine or a fixed ffmpeg gets its chance."""
+    talk = _ingest(conn, tmp_path, b"\x1aE\xdf\xa3", "Talk.mkv")
+    original = paths.DATA_DIR / talk["store_path"]
+    proxy = media.proxy_path_for(talk["sha256"])
+    _stuck_transcodes(monkeypatch)
+    with pytest.raises(playback.ProxyError):
+        playback.ensure_proxy(original, proxy)
+
+    monkeypatch.setattr(playback, "transcode", lambda src, dst: dst.write_bytes(b"aac"))
+    monkeypatch.setattr(playback, "probe_duration", lambda path: 20.0)
+    assert playback.main([]) == 0
+
+    assert proxy.is_file()

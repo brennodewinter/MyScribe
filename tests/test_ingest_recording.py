@@ -893,4 +893,8 @@ def test_a_remux_that_stops_reading_is_a_failure_not_a_hang(tmp_path, monkeypatc
 
     assert time.monotonic() - started < 10
     assert isinstance(outcome.get("error"), recording.RemuxFailed), outcome
+    # The watchdog's own verdict, not the returncode branch's: the killed
+    # child exits non-zero too, so a RemuxFailed alone would still be raised
+    # with the timeout branch deleted.
+    assert "did not finish" in str(outcome["error"]), outcome
     assert not dst.exists()
