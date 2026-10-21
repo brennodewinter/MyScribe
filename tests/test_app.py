@@ -402,6 +402,26 @@ def test_health_names_the_process_that_serves(client):
     assert client.get("/health").json()["pid"] == os.getpid()
 
 
+def test_jobs_list_is_bounded_and_takes_a_limit(client, conn):
+    """The table only grows; the endpoint never hands out all of it."""
+    jobs.enqueue_many(conn, "fake", [{}] * 5)
+
+    rows = client.get("/api/jobs", params={"limit": 2}).json()
+    assert len(rows) == 2
+    assert rows[0]["id"] > rows[1]["id"]  # newest first
+
+
+def test_jobs_list_never_exceeds_the_ceiling(client, conn, monkeypatch):
+    """Seeded past the ceiling, or the clamp could be missing and this pass."""
+    import scribe.app as app_module
+
+    monkeypatch.setattr(app_module, "JOBS_LIST_LIMIT", 2)
+    jobs.enqueue_many(conn, "fake", [{}] * 3)
+
+    rows = client.get("/api/jobs", params={"limit": 10_000}).json()
+    assert len(rows) == 2  # clamped to JOBS_LIST_LIMIT, not an error
+
+
 def test_cancel_ends_a_running_row_whose_claim_never_got_a_runner(client, conn):
     """#29: no pid will ever be written, so there is nothing to signal and no
     reason to keep the row running."""

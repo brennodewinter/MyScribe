@@ -1134,11 +1134,17 @@ async def save_llm_defaults(request: Request) -> Response:
         else:
             host_row = ""
 
-    wanted = (fields.get("provider") or "").strip()
-    if wanted:
-        if wanted not in ai_ui.llm.PROVIDERS:
-            raise HTTPException(status_code=400, detail=f"unknown LLM provider {wanted!r}")
-        ai_ui.setting_put(conn, ai_ui.PROVIDER_SETTING, wanted)
+    # `provider` is a select: it is always in the form, and an empty answer
+    # is the person un-choosing, not the field being absent - so empty drops
+    # the row rather than leaving the last provider standing.
+    if "provider" in fields:
+        wanted = (fields.get("provider") or "").strip()
+        if wanted:
+            if wanted not in ai_ui.llm.PROVIDERS:
+                raise HTTPException(status_code=400, detail=f"unknown LLM provider {wanted!r}")
+            ai_ui.setting_put(conn, ai_ui.PROVIDER_SETTING, wanted)
+        else:
+            ai_ui.setting_drop(conn, ai_ui.PROVIDER_SETTING)
 
     for name in ai_ui.llm.PROVIDERS:
         field = f"{ai_ui.MODEL_FIELD_PREFIX}{name}"
