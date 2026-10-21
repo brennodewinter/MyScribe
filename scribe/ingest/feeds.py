@@ -470,7 +470,9 @@ def poll(
     # set difference and finds the new episode wherever it sits; a cap
     # (`playlistend`) would keep the first entries in document order, and a
     # source that lists oldest first would never show its new ones again.
-    # What bounds a huge listing is the watcher's `PROBE_TIMEOUT_SECONDS`.
+    # On the watcher's thread a huge listing is bounded by
+    # `PROBE_TIMEOUT_SECONDS`; the Feeds page's "check now" hands in the
+    # plain probe and waits for it, on a threadpool worker.
     try:
         info = probe(feed["url"], limit=None)
     except Exception as exc:  # noqa: BLE001 - any failure is the feed's failure
