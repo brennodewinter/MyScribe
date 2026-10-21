@@ -572,11 +572,48 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+class NewerSchemaError(Exception):
+    """The library's schema is newer than this build knows.
+
+    `migrate` raises it rather than walking an empty ladder and serving a
+    schema the code cannot read - which is what used to happen, surfacing
+    later as missing-column errors on arbitrary pages and jobs.
+    """
+
+
 def migrate(conn: sqlite3.Connection) -> None:
-    """Bring the database to SCHEMA_VERSION via the PRAGMA user_version ladder."""
+    """Bring the database to SCHEMA_VERSION via the PRAGMA user_version ladder.
+
+    Two properties beyond "the ladder exists":
+
+    * A library newer than this build is refused, not served. The range is
+      empty going down, so without the check an older copy would open the
+      database and fail later, column by column - the answer `doctor` and
+      `library.refusal` already give, now from the one door every caller
+      comes through.
+    * Each migration runs inside one transaction. Bare `executescript`
+      commits every statement as it goes, so an interrupted migration used
+      to leave applied DDL under an un-bumped `user_version` - and every
+      later start failed on the same `already exists`, for good. The
+      `BEGIN IMMEDIATE`/`COMMIT` is inside the script text because
+      executescript commits any pending transaction of its own first.
+    """
     with LOCK:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise NewerSchemaError(
+                f"this library was written by a newer MyScribe (schema v{version}; "
+                f"this version knows v{SCHEMA_VERSION}) - update MyScribe, "
+                "or point SCRIBE_DATA_DIR at a library this version wrote"
+            )
         for target in range(version + 1, SCHEMA_VERSION + 1):
-            conn.executescript(_MIGRATIONS[target - 1])
-            conn.execute(f"PRAGMA user_version = {target:d}")
-            conn.commit()
+            try:
+                conn.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    + _MIGRATIONS[target - 1]
+                    + f"\nPRAGMA user_version = {target:d};\nCOMMIT;"
+                )
+            except sqlite3.Error:
+                conn.rollback()
+                raise
+        conn.commit()

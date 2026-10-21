@@ -64,6 +64,46 @@ def test_migrate_creates_schema_and_is_idempotent(conn):
     assert EXPECTED_TABLES <= names
 
 
+def test_migrate_refuses_a_library_newer_than_this_build(conn):
+    """An empty ladder going down used to mean "served anyway": an older copy
+    opened a newer library and failed later, column by column."""
+    db.migrate(conn)
+    conn.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION + 1}")
+    conn.commit()
+
+    with pytest.raises(db.NewerSchemaError, match="newer MyScribe"):
+        db.migrate(conn)
+
+
+def test_an_interrupted_migration_leaves_nothing_applied(conn, monkeypatch):
+    """Each migration is one transaction: a script that fails halfway leaves
+    no DDL behind and does not bump user_version, so the next migrate()
+    retries the whole version rather than dying on `already exists` (bare
+    executescript commits each statement; the BEGIN/COMMIT is inside the
+    script text because executescript commits a pending transaction first)."""
+    db.migrate(conn)
+    before = conn.execute("PRAGMA user_version").fetchone()[0]
+    originals = list(db._MIGRATIONS)
+    monkeypatch.setattr(
+        db,
+        "_MIGRATIONS",
+        [*originals, "CREATE TABLE atomic_probe(x); CREATE TABLE atomic_probe(x);"],
+    )
+    monkeypatch.setattr(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 1)
+
+    with pytest.raises(sqlite3.OperationalError, match="already exists"):
+        db.migrate(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == before
+    assert "atomic_probe" not in {
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    # and the retry does the whole version, from the top
+    monkeypatch.setattr(db, "_MIGRATIONS", [*originals, "CREATE TABLE atomic_probe(x);"])
+    db.migrate(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == before + 1
+
+
 def _indexes(conn) -> set[str]:
     return {
         row["name"]
