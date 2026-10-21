@@ -555,6 +555,29 @@ _MIGRATIONS: list[str] = [
 ]
 
 
+BUSY_TIMEOUT_MS = 30_000
+"""How long a write waits for another writer before SQLite says "locked".
+
+Five seconds was too short for the one writer that is legitimately slow - a
+finalize committing tens of thousands of word rows on a slow disk - and
+nothing retried, so a runner's bookkeeping write behind it failed a job whose
+work was done (GitHub #38). In WAL mode every write here starts its
+transaction with that write, so the busy handler covers all of them and a
+retry loop at each commit point is not needed."""
+
+
+class NewerSchema(RuntimeError):
+    """A library written by a newer MyScribe than this one (GitHub #31)."""
+
+
+def newer_schema(version: int) -> str:
+    """The sentence for a library this version cannot use; the doctor and
+    `library.newer_than_this_app` say the same in their own places."""
+    return (f"This library was written by a newer MyScribe (schema v{version}); this version "
+            f"knows v{SCHEMA_VERSION} and has not touched it. Update MyScribe, or point "
+            "SCRIBE_DATA_DIR at the library this version wrote.")
+
+
 def connect(path: str | Path | None = None) -> sqlite3.Connection:
     """Open the scribe database (paths.DB_PATH unless overridden)."""
     assert sqlite3.sqlite_version_info >= (3, 35, 0), (
@@ -568,7 +591,7 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS:d}")
     # Transcripts and cleartext API keys live in here; SQLite creates the file
     # with the process umask, and 0644 is the wrong default for that (the same
     # answer .env got). The -wal/-shm sidecars carry the same bytes.
@@ -580,10 +603,28 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Bring the database to SCHEMA_VERSION via the PRAGMA user_version ladder."""
+    """Bring the database to SCHEMA_VERSION via the PRAGMA user_version ladder.
+
+    Each step is one transaction - its statements and its user_version
+    together. `executescript` commits every statement on its own, so a step
+    that died half-way used to leave its first tables behind with the version
+    unmoved, and every later start failed on `already exists` (GitHub #30).
+    SQLite's DDL is transactional, and none of the steps holds a statement
+    that cannot run inside one.
+
+    A library from a newer MyScribe is refused, not served: nothing migrates
+    backwards, so this version would run on a schema it does not know
+    (GitHub #31).
+    """
     with LOCK:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise NewerSchema(newer_schema(version))
         for target in range(version + 1, SCHEMA_VERSION + 1):
-            conn.executescript(_MIGRATIONS[target - 1])
-            conn.execute(f"PRAGMA user_version = {target:d}")
-            conn.commit()
+            try:
+                conn.executescript(f"BEGIN IMMEDIATE;\n{_MIGRATIONS[target - 1]}\n"
+                                   f"PRAGMA user_version = {target:d};\nCOMMIT;")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise

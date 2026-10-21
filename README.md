@@ -119,3 +119,18 @@ door that closes by itself - see [its page](docs/receive-from-phone.md).
 | [Development](docs/development.md) | Running from source, tests, architecture and releases |
 
 What changed in each version is in the [changelog](CHANGELOG.md).
+
+## License
+
+Copyright © 2026 Robert van den Breemen.
+
+MyScribe was initiated and conceived by Robert van den Breemen and is
+developed as an open-source project.
+
+MyScribe is licensed under the European Union Public Licence v. 1.2
+(EUPL-1.2). You may use, study, share, and modify the software under the terms
+of that licence. The full text is in [LICENSE.md](LICENSE.md); the official
+versions in all EU languages are available from the
+[EUPL collection](https://interoperable-europe.ec.europa.eu/collection/eupl/eupl-text-eupl-12).
+
+SPDX-License-Identifier: EUPL-1.2

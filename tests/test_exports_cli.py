@@ -519,3 +519,17 @@ def test_the_module_entry_point_runs_the_cli(tmp_path):
     for flag in ("--all", "--folder", "--format", "--preset", "--out", "--cpl", "--no-speakers"):
         assert flag in proc.stdout, flag
     assert not (tmp_path / "data").exists()  # --help touches nothing
+
+
+def test_the_cli_refuses_a_library_from_a_newer_myscribe(tmp_path, monkeypatch):
+    """#31's matching gap: the CLI refused an older schema, not a newer one."""
+    path = tmp_path / "myscribe.db"
+    conn = db.connect(path)
+    db.migrate(conn)
+    conn.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(paths, "DB_PATH", path)
+
+    with pytest.raises(cli.Refused, match="newer MyScribe"):
+        cli.open_database()
