@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Callable
 
 DATA_DIR = Path(os.environ.get("SCRIBE_DATA_DIR", Path(__file__).resolve().parent.parent / "data"))
 # The database carries the application's name. It was `scribe.db` until
@@ -98,3 +99,33 @@ def remove_job_work_dir(job_id: int) -> bool:
     except OSError:
         return False
     return not work.exists()
+
+
+def sweep_work_dirs(keep: Callable[[int], bool]) -> int:
+    """Remove job scratch directories whose job no longer has work ahead of it.
+
+    ``keep(job_id)`` says whether the job may still need it - in practice
+    `jobs.keeps_its_scratch`, which also covers a job that starts while this
+    runs (GitHub #33); the caller owns the database this module stays below. A name that is not a job id
+    is not a job's scratch - the recordings' `rec/` lives beside them - and
+    is left alone, as is anything that will not delete.
+
+    The "later sweep" `remove_job_work_dir` has always deferred to: every
+    exit the runner does not live to see - SIGKILL, an OOM-kill, a power
+    cut, `taskkill` - skips its finally, and ~115 MB an hour of audio is a
+    debt that otherwise only grows.
+    """
+    import shutil
+
+    if not WORK_DIR.is_dir():
+        return 0
+    removed = 0
+    for entry in WORK_DIR.iterdir():
+        if not entry.is_dir() or not entry.name.isdigit() or keep(int(entry.name)):
+            continue
+        try:
+            shutil.rmtree(entry)
+        except OSError:
+            continue
+        removed += 1
+    return removed
