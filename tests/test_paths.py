@@ -1,5 +1,6 @@
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,9 @@ def _existing_data_dir(tmp_path, monkeypatch, mode):
 def test_a_data_dir_opened_to_a_group_keeps_its_mode(tmp_path, monkeypatch, mode):
     """A group somebody let in on purpose is theirs: ensure_dirs must not
     tighten it back at every start."""
+    # Linux, where a user's own group is private to them. Pinned, because on
+    # a Mac runner tmp_path sits in group staff and is tightened further.
+    monkeypatch.setattr(sys, "platform", "linux")
     data = _existing_data_dir(tmp_path, monkeypatch, mode)
 
     paths.ensure_dirs()
@@ -62,7 +66,38 @@ def test_an_existing_data_dir_stops_letting_everybody_in(tmp_path, monkeypatch, 
     """GitHub #42: every library made before this fix sits at the umask's
     0755, so media/ stays traversable and the recordings world-readable.
     The bits for "other" go; the owner's and the group's stay."""
+    monkeypatch.setattr(sys, "platform", "linux")
     data = _existing_data_dir(tmp_path, monkeypatch, before)
+
+    paths.ensure_dirs()
+
+    assert stat.S_IMODE(data.stat().st_mode) == after
+
+
+@pytest.mark.skipif(os.name == "nt", reason="mode bits are a POSIX answer; Windows has ACLs")
+@pytest.mark.parametrize("before", [0o755, 0o750, 0o770, 0o777], ids=oct)
+def test_a_mac_library_in_group_staff_stops_letting_every_account_in(tmp_path, monkeypatch, before):
+    """GitHub #42: on macOS every local account has primary group staff and
+    a new file takes its folder's group, so a 0750 library in staff is as
+    open as a 0755 one. There the group bits go too."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    data = _existing_data_dir(tmp_path, monkeypatch, before)
+    # chown to gid 20 needs root; call the directory's own group the shared one.
+    monkeypatch.setattr(paths, "_DARWIN_SHARED_GROUPS", {data.stat().st_gid}, raising=False)
+
+    paths.ensure_dirs()
+
+    assert stat.S_IMODE(data.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="mode bits are a POSIX answer; Windows has ACLs")
+@pytest.mark.parametrize("before, after", [(0o750, 0o750), (0o755, 0o750)])
+def test_a_mac_library_given_its_own_group_keeps_it(tmp_path, monkeypatch, before, after):
+    """A Mac library chgrp'ed to a group of its own was shared on purpose:
+    only "other" goes, as on Linux."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    data = _existing_data_dir(tmp_path, monkeypatch, before)
+    monkeypatch.setattr(paths, "_DARWIN_SHARED_GROUPS", {data.stat().st_gid + 1}, raising=False)
 
     paths.ensure_dirs()
 

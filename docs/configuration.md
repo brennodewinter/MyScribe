@@ -83,6 +83,12 @@ folder set with `install.py --data-dir` or `SCRIBE_DATA_DIR`.
 **Back up `myscribe.db` and `media/`.** Everything else can be downloaded or
 rebuilt.
 
+**Only you can open the library.** On Linux and macOS, MyScribe removes other
+accounts' access to the folder at every start, and on a Mac also the access
+of the shared `staff` group. To share it, for example with a media server
+under another account, give the folder a group of its own (`chgrp`): MyScribe
+leaves that group's access alone.
+
 ## GPU and CPU
 
 | Your computer | Transcription | Speakers |
