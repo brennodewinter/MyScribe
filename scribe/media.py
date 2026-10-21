@@ -273,13 +273,18 @@ def sweep_parts(older_than: float = PART_SWEEP_SECONDS) -> int:
     `finally` of the process that made it. A process that dies mid-write
     (kill, OOM, a power cut) leaves it behind, and nothing else ever looks:
     this is the sweep those leftovers were written for.
+
+    All three sit one directory below MEDIA_DIR, so that is as deep as it
+    looks (GitHub #39): it runs hourly on the watcher's thread, and an
+    `rglob` would descend into anything else that ever comes to live under
+    the store - and delete from it. A new writer deeper down belongs here.
     """
     root = paths.MEDIA_DIR
     if not root.is_dir():
         return 0
     cutoff = time.time() - float(older_than)
     removed = 0
-    for part in root.rglob("*.part"):
+    for part in root.glob("*/*.part"):
         try:
             if part.is_file() and part.stat().st_mtime < cutoff:
                 part.unlink()

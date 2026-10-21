@@ -271,14 +271,7 @@ def create_app(
         supervisor.reconcile(conn)
         supervisor.sweep_stderr()
         recording.sweep(conn)
-        with db.LOCK:
-            active = {
-                row["id"]
-                for row in conn.execute(
-                    "SELECT id FROM job WHERE status IN ('queued','running')"
-                )
-            }
-        paths.sweep_work_dirs(lambda job_id: job_id in active)
+        paths.sweep_work_dirs(jobs.keeps_its_scratch(conn))
         media.sweep_parts()
         # And one question about what this app could not do yet when those
         # recordings were made: which of them still say "Speaker 1" because

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from scribe import paths
 
 
@@ -40,10 +42,13 @@ def test_the_work_dir_sweep_survives_a_dir_that_will_not_delete(tmp_path, monkey
     (work / "2").mkdir(parents=True)
     real = shutil.rmtree
 
-    def flaky(p):
-        if str(p).endswith("/1"):
+    # By name, not by `str(p).endswith("/1")`: on Windows the separator is a
+    # backslash, the stand-in never raised, and the test went red there for a
+    # sweep that was fine (GitHub #33).
+    def flaky(p, *args, **kwargs):
+        if Path(p).name == "1":
             raise OSError("busy")
-        return real(p)
+        return real(p, *args, **kwargs)
 
     monkeypatch.setattr(shutil, "rmtree", flaky)
     assert paths.sweep_work_dirs(keep=lambda job_id: False) == 1

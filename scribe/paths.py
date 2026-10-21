@@ -104,8 +104,9 @@ def remove_job_work_dir(job_id: int) -> bool:
 def sweep_work_dirs(keep: Callable[[int], bool]) -> int:
     """Remove job scratch directories whose job no longer has work ahead of it.
 
-    ``keep(job_id)`` says whether the job is queued or running; the caller
-    owns the database this module stays below. A name that is not a job id
+    ``keep(job_id)`` says whether the job may still need it - in practice
+    `jobs.keeps_its_scratch`, which also covers a job that starts while this
+    runs (GitHub #33); the caller owns the database this module stays below. A name that is not a job id
     is not a job's scratch - the recordings' `rec/` lives beside them - and
     is left alone, as is anything that will not delete.
 

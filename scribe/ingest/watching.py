@@ -104,6 +104,10 @@ the first failure recoverable - the finished file hashes differently, so it
 arrives as its own row on the next start rather than being lost."""
 
 POLL_INTERVAL = 2.0
+"""Seconds between ticks. Each tick reconciles the observer's schedules against
+the enabled `watch_folder` rows and then pumps the pending files, so a folder
+added in Settings starts being watched within one interval rather than at the
+next app start."""
 
 HOUSEKEEPING_SECONDS = 3600.0
 """How often the loop runs the sweeps that keep a long session from littering.
@@ -115,10 +119,6 @@ at a time, so the sweeps ride this loop too. An hour is long enough that
 the sweeps cost nothing and short enough that no run adds more than a few
 hundred megabytes of it.
 """
-"""Seconds between ticks. Each tick reconciles the observer's schedules against
-the enabled `watch_folder` rows and then pumps the pending files, so a folder
-added in Settings starts being watched within one interval rather than at the
-next app start."""
 
 PARTIAL_SUFFIXES = frozenset(
     {".part", ".crdownload", ".partial", ".tmp", ".download", ".opdownload", ".!qb"}
@@ -976,14 +976,7 @@ class Watcher:
         harmless the first time and a disk problem the thousandth.
         """
         _survive(recording.sweep, conn)
-        with db.LOCK:
-            active = {
-                row["id"]
-                for row in conn.execute(
-                    "SELECT id FROM job WHERE status IN ('queued','running')"
-                )
-            }
-        _survive(paths.sweep_work_dirs, lambda job_id: job_id in active)
+        _survive(lambda: paths.sweep_work_dirs(jobs.keeps_its_scratch(conn)))
         _survive(media.sweep_parts)
 
     def request_reconcile(self) -> None:
