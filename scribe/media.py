@@ -241,6 +241,38 @@ def _place(src: Path, dst: Path, *, link: bool) -> None:
         tmp.unlink(missing_ok=True)
 
 
+PART_SWEEP_SECONDS = 24 * 3600
+"""How old a `.part` may be before it is litter and not a write in flight.
+
+A day is far past any upload, hash or transcode this module runs, so age is
+the whole test - a part still being written is younger by far.
+"""
+
+
+def sweep_parts(older_than: float = PART_SWEEP_SECONDS) -> int:
+    """Remove `.part` files under MEDIA_DIR older than ``older_than`` seconds.
+
+    Every `.part` here - the `.incoming` buffer, the shard file `_place`
+    copies through, the transcode a proxy writes - is deleted by the
+    `finally` of the process that made it. A process that dies mid-write
+    (kill, OOM, a power cut) leaves it behind, and nothing else ever looks:
+    this is the sweep those leftovers were written for.
+    """
+    root = paths.MEDIA_DIR
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - float(older_than)
+    removed = 0
+    for part in root.rglob("*.part"):
+        try:
+            if part.is_file() and part.stat().st_mtime < cutoff:
+                part.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 PRIVATE_DEFAULT_SETTING = "private_default"
 """Whether a newly ingested recording starts pinned private.
 

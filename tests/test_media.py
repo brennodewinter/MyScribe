@@ -8,6 +8,7 @@ user's source file.
 
 import hashlib
 import os
+import time
 
 import pytest
 
@@ -380,3 +381,26 @@ def test_a_deduped_arrival_without_a_source_changes_nothing(conn, data_dir, src_
 
     assert again["deduped"] is True
     assert (again["source_url"], again["source_id"]) == ("https://a.test/1.mp3", "Generic:g1")
+
+
+# --- the .part sweep ---------------------------------------------------------
+
+
+def test_sweep_parts_removes_abandoned_writes_but_not_live_ones(data_dir):
+    incoming = data_dir / "media" / ".incoming"
+    incoming.mkdir()
+    shard = data_dir / "media" / "ab"
+    shard.mkdir()
+    old = time.time() - 2 * media.PART_SWEEP_SECONDS
+    for path in (incoming / "old.part", shard / "old.part"):
+        path.write_bytes(b"x")
+        os.utime(path, (old, old))
+    fresh = incoming / "fresh.part"
+    fresh.write_bytes(b"y")
+    stored = shard / "stored.wav"
+    stored.write_bytes(b"z")
+    os.utime(stored, (old, old))
+
+    assert media.sweep_parts() == 2
+    assert fresh.exists(), "a part still being written is younger than the cutoff"
+    assert stored.exists(), "only .part files are litter"

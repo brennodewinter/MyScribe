@@ -90,6 +90,7 @@ from typing import Callable, NamedTuple, Sequence
 from pydantic import ValidationError
 
 from scribe import db, fsbrowse, jobs, media, paths
+from scribe.ingest import recording
 from scribe.options import TranscribeOptions
 from scribe.stages.probe import AUDIO_EXTENSIONS, MEDIA_EXTENSIONS
 
@@ -103,6 +104,17 @@ the first failure recoverable - the finished file hashes differently, so it
 arrives as its own row on the next start rather than being lost."""
 
 POLL_INTERVAL = 2.0
+
+HOUSEKEEPING_SECONDS = 3600.0
+"""How often the loop runs the sweeps that keep a long session from littering.
+
+The app sweeps once at startup, which is often enough for a process that is
+opened, used and closed. One that runs for weeks - the shape this app's
+watched folders and feeds encourage - accumulates the same debris an hour
+at a time, so the sweeps ride this loop too. An hour is long enough that
+the sweeps cost nothing and short enough that no run adds more than a few
+hundred megabytes of it.
+"""
 """Seconds between ticks. Each tick reconciles the observer's schedules against
 the enabled `watch_folder` rows and then pumps the pending files, so a folder
 added in Settings starts being watched within one interval rather than at the
@@ -687,6 +699,9 @@ class Watcher:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._walk_again = threading.Event()  # request_reconcile (TASK-107.01)
+        # First housekeeping an hour in, not on the first tick: the app sweeps
+        # the same litter at startup, so a Watcher built then has nothing to do.
+        self._next_housekeeping = time.monotonic() + HOUSEKEEPING_SECONDS
         self._thread: threading.Thread | None = None
 
     # --- the seam the tests drive ---------------------------------------------------
@@ -940,6 +955,9 @@ class Watcher:
                     self._walk_again.clear()
                     _survive(self.reconcile, conn)
                 _survive(self.pump, conn)
+                if time.monotonic() >= self._next_housekeeping:
+                    self._next_housekeeping = time.monotonic() + HOUSEKEEPING_SECONDS
+                    _survive(self._housekeeping, conn)
                 self._stop_event.wait(self.poll_interval)
         finally:
             if observer is not None:
@@ -949,6 +967,24 @@ class Watcher:
             # stop is not a reason to read the folder again tomorrow.
             _survive(self._save_taken)
             conn.close()
+
+    def _housekeeping(self, conn: sqlite3.Connection) -> None:
+        """The periodic version of the sweeps the app runs at startup.
+
+        Recording sessions abandoned mid-way, job scratch the runner never
+        lived to remove, `.part` files a dead process left - all of it is
+        harmless the first time and a disk problem the thousandth.
+        """
+        _survive(recording.sweep, conn)
+        with db.LOCK:
+            active = {
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM job WHERE status IN ('queued','running')"
+                )
+            }
+        _survive(paths.sweep_work_dirs, lambda job_id: job_id in active)
+        _survive(media.sweep_parts)
 
     def request_reconcile(self) -> None:
         """Walk the folders again on the next tick rather than at the next start.

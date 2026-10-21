@@ -38,7 +38,7 @@ import pytest
 from fastapi.testclient import TestClient
 from watchdog.events import DirCreatedEvent, FileCreatedEvent, FileModifiedEvent, FileMovedEvent
 
-from scribe import db, fsbrowse, media, paths
+from scribe import db, fsbrowse, jobs, media, paths
 from scribe.app import create_app
 from scribe.ingest import recording, watching
 from scribe.options import TranscribeOptions
@@ -2058,3 +2058,31 @@ def test_the_watch_card_says_nothing_of_the_kind_when_the_watcher_runs(conn):
 
     assert settings_ui.watch_context(conn, watcher=_Running())["watching"] is True
     assert settings_ui.watch_context(conn, watcher=None)["watching"] is False
+
+
+# --- housekeeping ------------------------------------------------------------
+
+
+def test_housekeeping_sweeps_the_same_litter_as_the_startup_sweep(watcher, conn, data_dir):
+    work = paths.WORK_DIR / "7"
+    work.mkdir(parents=True)
+    part = paths.MEDIA_DIR / ".incoming" / "deadbeef.part"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"x")
+    old = time.time() - media.PART_SWEEP_SECONDS - 1
+    os.utime(part, (old, old))
+
+    watcher._housekeeping(conn)
+
+    assert not work.exists() and not part.exists()
+
+
+def test_housekeeping_leaves_a_running_jobs_scratch_alone(watcher, conn, data_dir):
+    job_id = jobs.enqueue(conn, "fake")
+    jobs.claim_next(conn)
+    work = paths.job_work_dir(job_id)
+    work.mkdir(parents=True)
+
+    watcher._housekeeping(conn)
+
+    assert work.is_dir()

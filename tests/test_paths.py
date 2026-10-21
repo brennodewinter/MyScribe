@@ -17,6 +17,39 @@ def test_each_job_gets_its_own_work_directory():
     assert paths.job_work_dir(42) != paths.job_work_dir(43)
 
 
+def test_the_work_dir_sweep_removes_scratch_only_for_jobs_that_are_done(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "WORK_DIR", tmp_path / "work")
+    work = tmp_path / "work"
+    for name in ("1", "2", "rec", "not-a-job"):
+        (work / name).mkdir(parents=True)
+
+    removed = paths.sweep_work_dirs(keep=lambda job_id: job_id == 2)
+
+    assert removed == 1
+    assert not (work / "1").exists(), "job 1's job no longer has work ahead of it"
+    assert (work / "2").is_dir(), "job 2 still has work ahead of it"
+    assert (work / "rec").is_dir() and (work / "not-a-job").is_dir(), "not a job's scratch"
+
+
+def test_the_work_dir_sweep_survives_a_dir_that_will_not_delete(tmp_path, monkeypatch):
+    import shutil
+
+    monkeypatch.setattr(paths, "WORK_DIR", tmp_path / "work")
+    work = tmp_path / "work"
+    (work / "1").mkdir(parents=True)
+    (work / "2").mkdir(parents=True)
+    real = shutil.rmtree
+
+    def flaky(p):
+        if str(p).endswith("/1"):
+            raise OSError("busy")
+        return real(p)
+
+    monkeypatch.setattr(shutil, "rmtree", flaky)
+    assert paths.sweep_work_dirs(keep=lambda job_id: False) == 1
+    assert (work / "1").is_dir() and not (work / "2").exists()
+
+
 # --- the database's name ---------------------------------------------------------------
 
 
