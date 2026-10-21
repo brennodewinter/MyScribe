@@ -1433,3 +1433,13 @@ def test_a_user_s_own_term_outranks_the_built_in_name(conn):
 
     (row,) = glossary.stored(conn, run_id)
     assert row["rule"] != glossary.RULE_BUILT_IN
+
+
+def test_same_word_matches_beyond_ascii_case(conn):
+    """#50: the match moved into SQL, where LOWER() folds ASCII only - the
+    predicate there is this module's own casefold, so Ø and ß still match."""
+    media_id = seed.seed_media(conn, title="Guide")
+    run_id = seed.seed_run(conn, media_id, words=_words(
+        [" Ørsted", " en", " ØRSTED,", " Straße", " ørsted.", " Orsted"]))
+
+    assert [w["idx"] for w in glossary.same_word(conn, run_id, 0)] == [2, 4]

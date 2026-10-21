@@ -1051,16 +1051,27 @@ def same_word(conn: sqlite3.Connection, run_id: int, idx: int) -> list[dict]:
     target = _core(_word_row(conn, run_id, idx)["text"]).casefold()
     if not target:
         return []
+    # The match runs in SQL, so a four-hour run's ~40k words are not pulled
+    # into Python to find a handful (GitHub #50) - with this module's own
+    # predicate registered as a function, because SQLite's LOWER() folds
+    # ASCII only and "ØRSTED" would no longer match "Ørsted".
     with db.LOCK:
+        conn.create_function(_CORE_FOLD, 1, _core_fold, deterministic=True)
         rows = conn.execute(
             f"SELECT w.idx, w.text, c.rule AS rule, {CORRECTED_TEXT} AS shown"
-            f" FROM word w {CORRECTION_JOIN} WHERE w.run_id=? AND w.idx != ? ORDER BY w.idx",
-            (run_id, idx),
+            f" FROM word w {CORRECTION_JOIN} WHERE w.run_id=? AND w.idx != ?"
+            f" AND {_CORE_FOLD}(w.text) = ? ORDER BY w.idx",
+            (run_id, idx, target),
         ).fetchall()
-    return [
-        dict(row) for row in rows
-        if _core(str(row["text"])).casefold() == target and row["rule"] != RULE_MANUAL
-    ]
+    return [dict(row) for row in rows if row["rule"] != RULE_MANUAL]
+
+
+_CORE_FOLD = "myscribe_core_fold"
+
+
+def _core_fold(text: str | None) -> str:
+    """`_core(text).casefold()`, as the SQL function `same_word` filters by."""
+    return _core(str(text or "")).casefold()
 
 
 def correct_same(conn: sqlite3.Connection, run_id: int, idx: int, text: str) -> int:
