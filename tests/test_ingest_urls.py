@@ -435,6 +435,13 @@ def redirect_home(monkeypatch):
             server.server_close()
 
 
+HOP_REFUSED = "latest/meta-data points at this machine"
+"""What only the redirect check says: it names the hop's whole URL. The
+connect-time check would stop a loopback hop too, naming just the host - so
+matching this is what proves the hop itself was judged, which behind a proxy
+(no connect-time check) is the whole guard."""
+
+
 def test_a_feed_page_that_redirects_home_is_refused_at_the_hop(redirect_home):
     """GitHub #41: discovery's own fetch judges every redirect it is told to
     follow, against a real 302 - not only the URL it was handed."""
@@ -442,7 +449,7 @@ def test_a_feed_page_that_redirects_home_is_refused_at_the_hop(redirect_home):
         "application/rss+xml", "<rss/>",
     )
 
-    with pytest.raises(urls.UnsupportedUrl, match="local network"):
+    with pytest.raises(urls.UnsupportedUrl, match=HOP_REFUSED):
         urls.fetch_page(redirect_home.base + "/feed", limit=1000, public=True)
 
     assert redirect_home.origin_hits == ["/ok", "/feed"]
@@ -460,7 +467,7 @@ def test_a_followed_feeds_redirect_home_is_refused_at_the_hop(redirect_home):
     urls.public_only(ydl)
 
     assert ydl.urlopen(redirect_home.base + "/ok").read() == b"<rss/>"
-    with pytest.raises(RequestError, match="local network"):
+    with pytest.raises(RequestError, match=HOP_REFUSED):
         ydl.urlopen(redirect_home.base + "/feed")
 
     assert redirect_home.origin_hits == ["/ok", "/feed"]
@@ -538,7 +545,7 @@ def test_a_followed_feeds_ydl_connects_to_the_address_it_checked(rebinding):
 def test_a_followed_feeds_probe_never_reaches_the_redirect_target(redirect_home):
     """The same hop through the stage's own call: `probe(public=True)` with
     the real yt-dlp fails, and fails without touching this machine."""
-    with pytest.raises(urls.UrlError, match="local network"):
+    with pytest.raises(urls.UrlError, match=HOP_REFUSED):
         urls.probe(redirect_home.base + "/episode.mp3", public=True, discover=False)
 
     assert redirect_home.origin_hits

@@ -627,6 +627,10 @@ def _public_urllib_handler():
     ``prefer-legacy-http-handler`` option selects - so an unattended feed
     loses connection reuse, not features.
 
+    The director is a cached_property that only `YoutubeDL.close()` drops
+    (and rebuilds unguarded on next use); nothing here closes a `ydl` it
+    still means to use.
+
     Built on first use, because importing yt-dlp is what `build_ydl` exists
     to put off.
     """
