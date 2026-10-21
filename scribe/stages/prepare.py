@@ -36,7 +36,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
-from scribe import db, paths
+from scribe import db, media, paths
 
 if TYPE_CHECKING:  # avoids a runtime import cycle: runner imports this module
     from scribe.runner import RunnerContext
@@ -168,7 +168,7 @@ def run(ctx: "RunnerContext") -> None:
 
     dst = paths.job_work_dir(ctx.job["id"]) / WAV_NAME
     try:
-        to_wav(ctx.media_path, dst, _media_duration(ctx), ctx.report)
+        to_wav(ctx.media_path, dst, media.media_duration(ctx.conn, ctx.job.get("media_id")), ctx.report)
     except Exception:
         # A job that fails here never reaches finalize, which is what deletes
         # work directories - so this one would be collected by nobody. rmdir
@@ -182,15 +182,6 @@ def run(ctx: "RunnerContext") -> None:
     # The next stage reads samples, not the store: hand it the path rather
     # than making it re-derive one.
     ctx.state["wav"] = dst
-
-
-def _media_duration(ctx: "RunnerContext") -> float:
-    """Seconds of media as probe recorded them; 0 when nobody knows."""
-    with db.LOCK:
-        row = ctx.conn.execute(
-            "SELECT duration FROM media WHERE id=?", (ctx.job["media_id"],)
-        ).fetchone()
-    return float(row["duration"]) if row is not None and row["duration"] else 0.0
 
 
 def _tail(log: Path) -> str:

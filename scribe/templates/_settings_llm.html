@@ -65,7 +65,9 @@
   <form method="post" action="/settings/llm" hx-post="/settings/llm" hx-target="#llm-providers" hx-swap="outerHTML">
     <label class="field">Default provider
       <select name="provider">
-        {% if not llm_provider %}<option value="" selected>Choose a provider</option>{% endif %}
+        <option value=""{% if not llm_provider %} selected{% endif %}>
+          {%- if llm_provider %}No provider - nothing is sent anywhere{% else %}Choose a provider{% endif -%}
+        </option>
         {% for p in llm_providers %}
         <option value="{{ p.name }}"{% if p.name == llm_provider %} selected{% endif %}>{{ p.label }}{% if not p.local %} · leaves your machine{% endif %}</option>
         {% endfor %}

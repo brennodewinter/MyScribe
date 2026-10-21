@@ -99,6 +99,22 @@ def proxy_path_for(sha256: str) -> Path:
     return paths.MEDIA_DIR / PROXY_DIRNAME / f"{sha256}{PROXY_SUFFIX}"
 
 
+def media_duration(conn: sqlite3.Connection, media_id: int | None) -> float:
+    """Seconds of media as probe recorded it; 0 when nobody knows.
+
+    The one place this row is read: the runner stamps a job's runtime budget
+    from it, prepare sizes its progress bar with it, and finalize writes the
+    same number into the run row - three copies of the query used to drift
+    over whether the lock, the missing-row answer and the falsy answer were
+    handled the same way.
+    """
+    if not media_id:
+        return 0.0
+    with db.LOCK:
+        row = conn.execute("SELECT duration FROM media WHERE id=?", (media_id,)).fetchone()
+    return float(row["duration"]) if row is not None and row["duration"] else 0.0
+
+
 def ingest_path(
     conn: sqlite3.Connection,
     src: str | Path,

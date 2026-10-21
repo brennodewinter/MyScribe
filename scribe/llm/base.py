@@ -378,6 +378,15 @@ class Provider(ABC):
     def complete(self, req: ChatRequest) -> ChatResponse:
         """One completion, or an `LlmError`. Never a vendor exception."""
 
+    def close(self) -> None:
+        """Release whatever the client holds; a no-op for a provider with none.
+
+        Declared on the base so a caller that built the provider can always
+        close it without asking which kind it got: both implementations today
+        hold a connection pool, and a provider that does not can still answer
+        the question.
+        """
+
 
 # --- retrying -----------------------------------------------------------------------------
 
