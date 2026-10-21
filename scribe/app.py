@@ -271,6 +271,8 @@ def create_app(
         supervisor.reconcile(conn)
         supervisor.sweep_stderr()
         recording.sweep(conn)
+        paths.sweep_work_dirs(jobs.keeps_its_scratch(conn))
+        media.sweep_parts()
         # And one question about what this app could not do yet when those
         # recordings were made: which of them still say "Speaker 1" because
         # the identification pass did not exist. It queues a job each and
