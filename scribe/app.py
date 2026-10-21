@@ -410,7 +410,7 @@ def create_app(
         # and the answer is simple: end it.
         sup = getattr(request.app.state, "supervisor", None)
         if row["status"] == "running" and row["pid"] and not (sup and sup.owns(job_id)):
-            if supervisor.kill_orphan(row["pid"]):
+            if supervisor.kill_orphan(row["pid"], job_started_at=row["started_at"]):
                 jobs.finish(conn, job_id, "cancelled")
         return _job_out(conn, _get_job(conn, job_id))
 

@@ -604,6 +604,24 @@ def test_killing_what_is_already_gone_says_so_rather_than_raising():
     assert supervisor.kill_orphan(0) is False
 
 
+def test_kill_orphan_refuses_a_process_too_young_to_be_the_runner():
+    """A row's pid is reused: the process holding it started an hour after
+    the job was claimed, so it cannot be the runner the row meant - and the
+    kill would land on a stranger's process group."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        assert supervisor.pid_alive(child.pid)
+        if supervisor.process_started_at(child.pid) is None:
+            pytest.skip("this platform cannot say when a process started")
+
+        started_an_hour_ago = time.time() - 3600
+        assert supervisor.kill_orphan(child.pid, job_started_at=started_an_hour_ago) is False
+        assert supervisor.pid_alive(child.pid), "the stranger was signalled anyway"
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
 def test_a_supervisor_says_which_job_it_is_watching(db_path):
     sup = supervisor.Supervisor(db_path)
 
