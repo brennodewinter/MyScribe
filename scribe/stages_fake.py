@@ -9,6 +9,11 @@ stage does is driven by params["scenario"]:
 
 No real work happens here; these fakes exist so the job-system state
 machine can be proven without any GPU or media in sight.
+
+Outside pytest the type is shut (GitHub #51): a manual end-to-end run that
+enqueues a "fake" job against a real `python -m scribe` with a temporary
+SCRIBE_DATA_DIR needs SCRIBE_FAKE_STAGES=1 (`runner.FAKE_STAGES_VARIABLE`)
+in the app's environment, or the job ends as UNKNOWN_JOB_TYPE.
 """
 
 import time
