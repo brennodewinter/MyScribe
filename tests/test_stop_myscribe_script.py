@@ -148,7 +148,7 @@ def test_a_running_myscribe_is_asked_through_its_stop_route(install, started, tm
     launcher, _child = _launcher(install, started)
     app = _app(started)
     server = _Server({"ok": True, "pid": app, "launcher_pid": launcher},
-                     on_stop=lambda: _end(app, launcher))
+                     on_stop=lambda: _end(app))
     try:
         code, said = _run(install, server.port, tmp_path)
     finally:
