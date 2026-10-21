@@ -11,7 +11,7 @@ import json
 import sqlite3
 import statistics
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from scribe import applog, db
 
@@ -416,6 +416,36 @@ def queue_position(conn: sqlite3.Connection, job_id: int) -> int | None:
             {"priority": row["priority"], "seq": row["queue_seq"]},
         ).fetchone()[0]
     return ahead + 1
+
+
+def keeps_its_scratch(conn: sqlite3.Connection) -> Callable[[int], bool]:
+    """Whether a job id's work dir must survive a sweep: `paths.sweep_work_dirs`'s ``keep``.
+
+    A job queued or running keeps it, and so does any id above the newest one
+    this read saw. That second clause is the race (GitHub #33): the sweep lists
+    and removes directories after this read, and a job enqueued, claimed and
+    given its scratch in between - by this process or by another one on the
+    same data - is in no set read before it. Its id is above the MAX, though,
+    because a new rowid is always above the largest one present.
+
+    One statement, so the active ids and the MAX come from one snapshot; two
+    SELECTs could let another process's write land between them.
+
+    Not airtight, said here so nobody thinks it is: `id` is a plain INTEGER
+    PRIMARY KEY, so purging the newest job's recording (ON DELETE CASCADE)
+    frees its id for reuse. A purge, an enqueue, a claim and a spawn inside
+    one sweep would beat it; the next sweep is an hour away, not the end of
+    the job. Scratch above the MAX that nobody owns waits for the job that
+    gets its id, whose runner removes it.
+    """
+    with db.LOCK:
+        rows = conn.execute(
+            "SELECT id, status FROM job"
+            " WHERE status IN ('queued','running') OR id=(SELECT MAX(id) FROM job)"
+        ).fetchall()
+    active = {row["id"] for row in rows if row["status"] in ("queued", "running")}
+    newest = max((row["id"] for row in rows), default=0)
+    return lambda job_id: job_id in active or job_id > newest
 
 
 def active_count(conn: sqlite3.Connection) -> int:

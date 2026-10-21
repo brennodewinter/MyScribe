@@ -38,7 +38,7 @@ import pytest
 from fastapi.testclient import TestClient
 from watchdog.events import DirCreatedEvent, FileCreatedEvent, FileModifiedEvent, FileMovedEvent
 
-from scribe import db, fsbrowse, media, paths
+from scribe import db, fsbrowse, jobs, media, paths
 from scribe.app import create_app
 from scribe.ingest import recording, watching
 from scribe.options import TranscribeOptions
@@ -2058,6 +2058,105 @@ def test_the_watch_card_says_nothing_of_the_kind_when_the_watcher_runs(conn):
 
     assert settings_ui.watch_context(conn, watcher=_Running())["watching"] is True
     assert settings_ui.watch_context(conn, watcher=None)["watching"] is False
+
+
+# --- housekeeping ------------------------------------------------------------
+
+
+def _finished_job(conn) -> int:
+    """A job that ran and is done: its scratch, if any is left, is litter."""
+    job_id = jobs.enqueue(conn, "fake")
+    jobs.claim_next(conn)
+    jobs.finish(conn, job_id, "done")
+    return job_id
+
+
+def _litter() -> Path:
+    """A `.part` a dead upload left in `.incoming`, older than the cutoff."""
+    part = paths.MEDIA_DIR / ".incoming" / "deadbeef.part"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"x")
+    old = time.time() - media.PART_SWEEP_SECONDS - 1
+    os.utime(part, (old, old))
+    return part
+
+
+def test_housekeeping_sweeps_the_same_litter_as_the_startup_sweep(watcher, conn, data_dir):
+    work = paths.job_work_dir(_finished_job(conn))
+    work.mkdir(parents=True)
+    part = _litter()
+
+    watcher._housekeeping(conn)
+
+    assert not work.exists() and not part.exists()
+
+
+def test_housekeeping_keeps_the_scratch_of_a_job_that_started_during_the_sweep(
+    watcher, conn, data_dir, monkeypatch
+):
+    """GitHub #33: the queued/running ids used to be read once, before the
+    directories were listed. A job enqueued, claimed and given its scratch in
+    between - likelier while rmtree works through an hour of audio - was not
+    in that set, and its scratch went out from under the runner."""
+    real = paths.sweep_work_dirs
+    started: list[Path] = []
+
+    def a_job_starts_first(keep):
+        job_id = jobs.enqueue(conn, "fake")
+        jobs.claim_next(conn)
+        work = paths.job_work_dir(job_id)
+        work.mkdir(parents=True)
+        started.append(work)
+        return real(keep)
+
+    monkeypatch.setattr(paths, "sweep_work_dirs", a_job_starts_first)
+
+    watcher._housekeeping(conn)
+
+    (work,) = started
+    assert work.is_dir(), "the sweep removed a job's scratch while it ran"
+
+
+def test_the_watcher_loop_runs_housekeeping_once_it_is_due(db_path, monkeypatch):
+    """The scheduling itself, not just `_housekeeping`: drop the check from
+    the loop and the hourly sweep is quietly gone (GitHub #33, #39)."""
+    swept = threading.Event()
+    watcher = watching.Watcher(db_path, poll_interval=0.02, observer_factory=FakeObserver)
+    monkeypatch.setattr(watcher, "_housekeeping", lambda conn: swept.set())
+    watcher._next_housekeeping = 0.0  # due on the first tick
+
+    watcher.start()
+    try:
+        assert swept.wait(10), "the loop never ran its housekeeping"
+    finally:
+        watcher.stop()
+    assert watcher._next_housekeeping > time.monotonic(), "and the next one is an interval away"
+
+
+def test_the_app_sweeps_scratch_and_parts_at_startup(db_path, conn, data_dir):
+    """The startup half of the same sweep (GitHub #33, #39): the watcher's
+    first housekeeping is an hour in because the app has just done this."""
+    work = paths.job_work_dir(_finished_job(conn))
+    work.mkdir(parents=True)
+    part = _litter()
+
+    app = create_app(db_path=db_path, start_supervisor=False)
+    with TestClient(app, base_url="http://127.0.0.1"):
+        pass
+
+    assert not work.exists(), "a finished job's scratch survived the start"
+    assert not part.exists(), "an abandoned .part survived the start"
+
+
+def test_housekeeping_leaves_a_running_jobs_scratch_alone(watcher, conn, data_dir):
+    job_id = jobs.enqueue(conn, "fake")
+    jobs.claim_next(conn)
+    work = paths.job_work_dir(job_id)
+    work.mkdir(parents=True)
+
+    watcher._housekeeping(conn)
+
+    assert work.is_dir()
 
 
 # --- a walk that loops back on itself (GitHub #40) --------------------------------

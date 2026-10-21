@@ -217,10 +217,20 @@ def test_missing_job_id_returns_failure(conn):
 
 
 def test_stage_registry_shape():
-    assert "fake" in runner.STAGES
-    names = [name for name, fn in runner.STAGES["fake"]]
+    # The shipped registry is closed: "fake" is a test seam, reached through
+    # _stages_for only when the environment opts in (conftest does).
+    assert "fake" not in runner.STAGES
+    names = [name for name, fn in runner._stages_for("fake")]
     assert names == ["one", "two", "three"]
-    assert all(callable(fn) for _, fn in runner.STAGES["fake"])
+    assert all(callable(fn) for _, fn in runner._stages_for("fake"))
+
+
+def test_the_fake_seam_stays_shut_without_the_flag(conn, monkeypatch):
+    monkeypatch.delenv(runner.FAKE_STAGES_VARIABLE)
+    job_id = jobs.enqueue(conn, "fake")
+    jobs.claim_next(conn)
+    assert runner.main([str(job_id)]) == 1
+    assert _job_row(conn, job_id)["error_code"] == "UNKNOWN_JOB_TYPE"
 
 
 # --- work directory never outlives the job -----------------------------------

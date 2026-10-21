@@ -12,6 +12,7 @@ themselves (see stages_fake.slow).
 
 import errno
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from scribe import accel, applog, cuda_setup, db, doctor, jobs, media, paths, stages_fake
+from scribe import accel, applog, cuda_setup, db, doctor, jobs, media, paths
 from scribe.ingest import urls
 from scribe.llm import privacy as llm_privacy
 from scribe.llm.base import ContextTooLong, LlmError
@@ -32,7 +33,7 @@ from scribe.stages import (
 # Minimum seconds between stage-progress writes from ctx.report().
 REPORT_MIN_INTERVAL = 0.4
 
-# Ordered (stage_name, fn) lists per job type. "fake" drives the tests;
+# Ordered (stage_name, fn) lists per job type.
 # "transcribe" is the real pipeline, filled in task by task in Phase 2;
 # "doctor" is the GPU checks and "llm" is a question about a transcript, both
 # run here because neither a model nor a provider may be touched by the web
@@ -42,13 +43,31 @@ REPORT_MIN_INTERVAL = 0.4
 # only because the settings page queues one per media and a library-wide sweep
 # has no business happening inside a request.
 STAGES: dict[str, list[tuple[str, Callable]]] = {
-    "fake": stages_fake.STAGES,
     "transcribe": TRANSCRIBE_STAGES,
     "doctor": doctor.DOCTOR_STAGES,
     llm_stage.JOB_TYPE: llm_stage.STAGES,
     url_stage.JOB_TYPE: url_stage.STAGES,
     correct.JOB_TYPE: correct.STAGES,
 }
+
+FAKE_STAGES_VARIABLE = "SCRIBE_FAKE_STAGES"
+"""Names the opt-in for job type "fake", which drives the tests.
+
+The test seam is real - the job-system state machine is proven against
+scripted stages with no GPU or media in sight - but it has no business
+answering in a shipped copy, where a queued "fake" job is a type the app
+never writes. The variable is checked when the job runs, not at import:
+a runner child inherits the environment its supervisor had, which is the
+moment that decides which copy of the seam it should see."""
+
+
+def _stages_for(job_type: str) -> list[tuple[str, Callable]] | None:
+    stages = STAGES.get(job_type)
+    if stages is None and job_type == "fake" and os.environ.get(FAKE_STAGES_VARIABLE):
+        from scribe import stages_fake
+
+        stages = stages_fake.STAGES
+    return stages
 
 # Exception class -> error_code taxonomy. Walked along the exception's MRO, so
 # the most specific class wins: PermissionError and FileNotFoundError are both
@@ -202,7 +221,7 @@ def _run(conn: sqlite3.Connection, job_id: int) -> int:
         return 1
     job = dict(row)
 
-    stages = STAGES.get(job["type"])
+    stages = _stages_for(job["type"])
     if stages is None:
         jobs.finish(
             conn,
