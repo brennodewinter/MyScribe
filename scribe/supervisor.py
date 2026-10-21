@@ -283,7 +283,7 @@ def is_zombie(pid: int | None) -> bool:
     return False
 
 
-def kill_orphan(pid: int | None) -> bool:
+def kill_orphan(pid: int | None, *, job_started_at: float | None = None) -> bool:
     """End a runner this process never spawned, and whatever it started.
 
     `_kill_tree` needs a `Popen`; an orphan is a bare pid. The shape is the
@@ -297,10 +297,22 @@ def kill_orphan(pid: int | None) -> bool:
     cancel flag for it, and `reconcile` leaves its row alone because the pid
     is alive and older than the job. A cancel then flipped the row and the
     work carried on - jobs 127 and 129, 2026-09-19.
+
+    `job_started_at` guards the last door a bare pid cannot: pid reuse. When
+    the holder demonstrably started more than `_PID_AGE_SLACK_SECONDS` after
+    the job did, it cannot be the runner the row meant - the spawn follows
+    the claim by milliseconds - and signalling it (or its whole group) would
+    end a stranger. Inside the slack, or when the platform cannot say, the
+    kill proceeds as before: a stranger there is indistinguishable from a
+    runner by construction.
     """
     if not pid_alive(pid) or not could_be_runner(pid):
         return False  # gone, or a reused pid: never signal a stranger (#32)
     pid = int(pid)
+    if job_started_at is not None:
+        process_start = process_started_at(pid)
+        if process_start is not None and process_start > float(job_started_at) + _PID_AGE_SLACK_SECONDS:
+            return False
     try:
         if sys.platform == "win32":
             subprocess.run(
