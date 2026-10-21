@@ -68,8 +68,12 @@ seconds: fast enough that a local model's answer appears while the user is
 still looking at the panel, slow enough that a four-minute map-reduce is a
 hundred cheap reads rather than a thousand."""
 
-PROVIDER_SETTING = "llm_provider"
-"""Which provider a new request opens with."""
+PROVIDER_SETTING = llm.PROVIDER_SETTING
+"""Which provider a new request opens with.
+
+Re-exported from `scribe.llm` for the same reason MODEL_SETTING_PREFIX is
+re-exported from `base` two lines below: a row spelled twice is a row that
+eventually disagrees, and llm/ is where the runner child already reads it."""
 
 MODEL_SETTING_PREFIX = base.MODEL_SETTING_PREFIX
 """One row per provider: model ids are provider-scoped (`base.retarget`), so a
