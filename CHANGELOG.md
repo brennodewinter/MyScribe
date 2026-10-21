@@ -11,6 +11,12 @@
 
 ### Changed
 
+- **An update or uninstall on Windows stops a running MyScribe first.** A
+  MyScribe started at login used to keep serving the old version after an
+  update. The installer now asks it to stop - its running job starts over
+  afterwards - or ends it when it is a version without a stop, and starts it
+  again without a window when *Start at login* is on. A server from a clone or
+  another install on the same port is left alone (TASK-112.04).
 - **Started at login, MyScribe runs without a window.** The login entry now
   starts the launcher with `--headless`, so there is no window to keep open;
   open MyScribe from its shortcut or at `http://localhost:4242`. An entry an
