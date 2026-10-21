@@ -39,7 +39,7 @@ from fastapi.testclient import TestClient
 
 from scribe import db, fsbrowse, paths
 from scribe.app import create_app
-from scribe.ingest import urls
+from scribe.ingest import feeds, urls
 from scribe.stages import transcribe, url_stage
 from scribe.web import ingest_ui
 from test_ingest_urls import FakeYdl, build_returning, playlist_info, single_info
@@ -1227,7 +1227,7 @@ def test_known_sources_marks_queued_and_running_jobs_but_no_terminal_one(conn):
     jobs.enqueue(conn, url_stage.JOB_TYPE, params={"url": FEED_URL})  # the feed itself, from Fetch
     assert conn.execute("SELECT status FROM job WHERE id=?", (running,)).fetchone()["status"] == "running"
 
-    states = ingest_ui.known_sources(conn, [{"url": u, "source_id": None} for u in urls_])
+    states = feeds.known_sources(conn, [{"url": u, "source_id": None} for u in urls_])
 
     assert states == ["queued", "queued", None, None, None, None, None]
 
@@ -1237,7 +1237,7 @@ def test_known_sources_matches_on_the_id_when_the_url_differs(conn, tmp_path, da
     the channel listing calls watch?v=ID; the extractor-scoped id says so."""
     _seed_media(conn, tmp_path, "a.mp3", source_url="https://youtu.be/vid0", source_id="Youtube:vid0")
 
-    states = ingest_ui.known_sources(
+    states = feeds.known_sources(
         conn,
         [
             {"url": "https://www.youtube.com/watch?v=vid0", "source_id": "Youtube:vid0"},

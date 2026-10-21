@@ -304,3 +304,39 @@ def test_unsubscribing_forgets_the_feed_and_keeps_the_jobs_it_made(conn):
 
     assert feeds.all_feeds(conn) == []
     assert len(_queued(conn)) == 1
+
+
+# --- the watcher's own manners ---------------------------------------------------
+
+
+def test_a_tick_spends_its_budget_and_leaves_the_rest_due(conn, monkeypatch):
+    """TICK_BUDGET_SECONDS is this wake's share: a feed the budget does not
+    reach stays due rather than waiting behind an afternoon of slow ones."""
+    import time
+
+    for i in range(3):
+        feeds.subscribe(conn, f"https://example.test/f{i}.xml", answered=True)
+    monkeypatch.setattr(feeds, "TICK_BUDGET_SECONDS", 0.0)
+    watcher = feeds.FeedWatcher("never-opened.db", probe=probing(playlist(entry(1))))
+
+    assert watcher.tick(conn) == 1
+    assert len(feeds.due_feeds(conn, now=time.time() + 60.0)) == 2
+
+
+def test_stop_keeps_a_thread_that_will_not_join(capsys):
+    """A failed join is not a dead thread: the reference stays, like
+    watching.Watcher.stop, because the two outcomes are not the same."""
+    import threading
+
+    watcher = feeds.FeedWatcher("never-opened.db")
+    hold = threading.Event()
+    thread = threading.Thread(target=hold.wait, daemon=True)
+    thread.start()
+    watcher._thread = thread
+
+    watcher.stop(timeout=0.01)
+
+    assert watcher._thread is thread
+    assert "still running" in capsys.readouterr().err
+    hold.set()
+    thread.join()
