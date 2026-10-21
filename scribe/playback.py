@@ -221,28 +221,52 @@ def source(original: Path, sha256: str) -> Source | None:
 # --- the proxy ---------------------------------------------------------------------------
 
 
+def _transcode_timeout(src: Path) -> float:
+    """How long the transcode may take before it is declared stuck.
+
+    Twice the source's own duration, so nobody's ten-hour recording is cut
+    off by a constant - but a transcode that runs longer than the audio is
+    long is not a slow transcode, it is a hung ffmpeg holding a request
+    thread and this proxy's lock for good. An unmeasurable source gets an
+    hour: a file ffprobe cannot read is an oddity already, and that bound
+    is what keeps the oddity from being a deadlock.
+    """
+    duration = probe_duration(src)
+    if duration is None:
+        return 3600.0
+    return max(600.0, duration * 2.0)
+
+
 def transcode(src: Path, dst: Path) -> None:
     """Write ``src``'s audio as AAC in a faststart MP4 at ``dst``.
 
     ``-f mp4`` is spelled out because ``dst`` is a ``.part`` name ffmpeg
     cannot infer a container from. CREATE_NO_WINDOW keeps a console from
-    flashing up on Windows; there is no timeout, because any constant would
-    be a lie about somebody else's ten-hour recording.
+    flashing up on Windows. The timeout scales with the source (see
+    `_transcode_timeout`): fixed values lie about somebody else's
+    recording, and no bound at all lets a stuck ffmpeg hold the request
+    thread forever.
     """
-    proc = subprocess.run(
-        [
-            "ffmpeg", "-nostdin", "-v", "error", "-y",
-            "-i", str(src),
-            "-vn", "-sn", "-dn",
-            "-c:a", "aac", "-b:a", PROXY_BITRATE,
-            "-movflags", "+faststart",
-            "-f", "mp4",
-            str(dst),
-        ],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-v", "error", "-y",
+                "-i", str(src),
+                "-vn", "-sn", "-dn",
+                "-c:a", "aac", "-b:a", PROXY_BITRATE,
+                "-movflags", "+faststart",
+                "-f", "mp4",
+                str(dst),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_transcode_timeout(src),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        raise ProxyError(
+            f"ffmpeg did not finish converting {src.name}; treating it as unreadable"
+        ) from None
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip()[-STDERR_TAIL:]
         raise ProxyError(f"ffmpeg could not convert {src.name}: {detail}")

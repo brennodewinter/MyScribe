@@ -829,3 +829,47 @@ def test_discarding_the_recording_lets_the_dialog_close_again(tmp_path):
     assert result["after"]["busy"] is None, "the dialog stayed locked after the discard"
     assert result["after"]["start"] is False, "Record never came back"
     assert result["closed"] == 1, "the dialog would not close once the recorder had stopped"
+
+
+# --- the remux's bound ---------------------------------------------------------
+
+
+def test_the_remux_timeout_scales_with_the_chunks(tmp_path):
+    """The bound is bytes over a floor speed, not a constant: any constant
+    lies about somebody else's longer recording."""
+    small = tmp_path / "a.webm"
+    small.write_bytes(b"x")
+    assert recording._remux_timeout([small]) == 60.0
+    with open(tmp_path / "b.webm", "wb") as f:
+        f.truncate(90 * recording.REMUX_MIN_BYTES_PER_SECOND)
+    assert recording._remux_timeout([tmp_path / "b.webm"]) == 90.0
+
+
+def test_a_stuck_remux_is_a_failure_not_a_hang(tmp_path, monkeypatch):
+    """A remux that never finishes is killed, its half file removed, and the
+    stop request gets a RemuxFailed rather than a thread that never returns."""
+    chunk = tmp_path / "c.webm"
+    chunk.write_bytes(b"x")
+
+    class Hung:
+        def __init__(self):
+            self.stdin = open(os.devnull, "wb")
+            self.killed = False
+
+        def wait(self, timeout=None):
+            if self.killed:
+                return -9
+            raise subprocess.TimeoutExpired("ffmpeg", timeout)
+
+        def kill(self):
+            self.killed = True
+
+    hung = Hung()
+    monkeypatch.setattr(recording.subprocess, "Popen", lambda *a, **k: hung)
+    dst = tmp_path / "out.mkv"
+    dst.write_bytes(b"partial")  # what ffmpeg managed before it hung
+
+    with pytest.raises(recording.RemuxFailed):
+        recording.remux([chunk], dst)
+
+    assert hung.killed and not dst.exists()

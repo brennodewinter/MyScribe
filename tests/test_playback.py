@@ -383,3 +383,29 @@ def test_a_backfill_with_a_failed_proxy_exits_1_and_says_why(conn, data_dir, tmp
 
     assert playback.main([]) == 1
     assert "no such codec" in capsys.readouterr().out
+
+
+def test_the_transcode_timeout_scales_with_the_source(monkeypatch, tmp_path):
+    """Twice the duration, so nobody's ten-hour recording hits a constant;
+    an unmeasurable source gets a bounded hour rather than forever."""
+    monkeypatch.setattr(playback, "probe_duration", lambda path: 60.0)
+    assert playback._transcode_timeout(tmp_path / "x.mkv") == 600.0  # the floor
+    monkeypatch.setattr(playback, "probe_duration", lambda path: 3600.0)
+    assert playback._transcode_timeout(tmp_path / "x.mkv") == 7200.0
+    monkeypatch.setattr(playback, "probe_duration", lambda path: None)
+    assert playback._transcode_timeout(tmp_path / "x.mkv") == 3600.0
+
+
+def test_a_stuck_transcode_is_a_refusal_not_a_hang(data_dir, monkeypatch, tmp_path):
+    """A transcode that never returns must not hold the request thread and
+    the proxy lock forever: it is a ProxyError like every other ffmpeg no."""
+    original = _original(data_dir, b"\x1aE\xdf\xa3", ".mkv")
+    monkeypatch.setattr(playback, "probe_duration", lambda path: 60.0)
+
+    def hang(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(playback.subprocess, "run", hang)
+
+    with pytest.raises(playback.ProxyError, match="did not finish"):
+        playback.transcode(original, tmp_path / "out.part")

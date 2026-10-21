@@ -92,6 +92,10 @@ STDERR_TAIL = 800
 # how much of a long recording is in memory at once.
 COPY_SIZE = 1 << 20
 
+# The floor a remux may stream at before it counts as stuck rather than slow:
+# a megabyte a second, a speed any disk still beats by a wide margin.
+REMUX_MIN_BYTES_PER_SECOND = 1_000_000
+
 # Exactly the alphabet `secrets.token_urlsafe` emits, and nothing else. No
 # dot, no separator either way round, so "..", "a/b" and "a\\b" are refused
 # before `Path` ever sees them.
@@ -406,7 +410,17 @@ def remux(chunks: list[Path], dst: str | Path) -> Path:
             )
             try:
                 _feed(proc, chunks)
-                returncode = proc.wait()
+                try:
+                    returncode = proc.wait(timeout=_remux_timeout(chunks))
+                except subprocess.TimeoutExpired:
+                    # Kill before the unlink: Windows refuses to delete a
+                    # file a process still holds open.
+                    proc.kill()
+                    proc.wait()
+                    dst.unlink(missing_ok=True)
+                    raise RemuxFailed(
+                        "ffmpeg did not finish assembling the recording in time"
+                    ) from None
             except BaseException:
                 proc.kill()
                 proc.wait()
@@ -420,6 +434,19 @@ def remux(chunks: list[Path], dst: str | Path) -> Path:
     finally:
         log.unlink(missing_ok=True)
     return dst
+
+
+def _remux_timeout(chunks: list[Path]) -> float:
+    """As long as the slowest honest disk needs: the chunks at 1 MB/s.
+
+    ``-c copy`` streams the input through, so the cost is proportional to
+    bytes and not duration - no constant could say where a long recording's
+    ceiling is without lying about a longer one. A remux slower than
+    `REMUX_MIN_BYTES_PER_SECOND` is a hung ffmpeg holding a request thread,
+    and that is what the bound exists to catch.
+    """
+    total = sum(chunk.stat().st_size for chunk in chunks)
+    return max(60.0, total / REMUX_MIN_BYTES_PER_SECOND)
 
 
 def _feed(proc: subprocess.Popen, chunks: list[Path]) -> None:
