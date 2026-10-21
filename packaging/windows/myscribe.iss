@@ -10,9 +10,14 @@
 
 #define MyAppName "MyScribe"
 #define MyAppExe "MyScribe.exe"
+; Overridden only by a test build (TASK-112.04), so that one never finds - and
+; updates - the MyScribe installed on the machine it is tried on.
+#ifndef MyAppId
+  #define MyAppId "{{B7F6E1C2-2C54-4C33-9D0B-6E9E3C0A1F21}"
+#endif
 
 [Setup]
-AppId={{B7F6E1C2-2C54-4C33-9D0B-6E9E3C0A1F21}
+AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=Robert van den Breemen
@@ -34,6 +39,9 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#MySource}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Stops a running MyScribe before it is replaced (TASK-112.04). In {app} for
+; the uninstaller; the installer extracts this same entry to {tmp} first.
+Source: "stop-myscribe.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
@@ -54,6 +62,70 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#MyAppExe}"; Description: "Start {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// A headless MyScribe (ADR-026) keeps serving the old code after an update,
+// and its python.exe lives in the home, outside {app}, where Restart Manager
+// does not look. stop-myscribe.ps1 asks it through its stop route, so its
+// running job is requeued (ADR-028), and ends what still runs from {app} -
+// which is all a 0.8.x server, without --stop or a route, can be stopped by.
+// Exit codes: 0 nothing was running, 10 stopped, 1 still running.
+const
+  StopNothing = 0;
+  StopDone = 10;
+
+var
+  StoppedOne: Boolean;
+
+function RunStopScript(Script: String; var Code: Integer): Boolean;
+begin
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + Script + '" -InstallDir "'
+      + ExpandConstant('{app}') + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Code: Integer;
+begin
+  Result := '';
+  ExtractTemporaryFile('stop-myscribe.ps1');
+  // No PowerShell at all leaves the file-in-use check to Restart Manager.
+  if not RunStopScript(ExpandConstant('{tmp}\stop-myscribe.ps1'), Code) then
+    Exit;
+  if Code = StopDone then
+    StoppedOne := True
+  else if Code <> StopNothing then
+    Result := 'MyScribe is still running and could not be stopped. Stop it - Settings > Start at '
+      + 'login > Stop MyScribe - and run Setup again.';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+begin
+  // Back the way the login item starts it, and only when that item is there:
+  // an update must not switch on a login start nobody chose.
+  if (CurStep = ssPostInstall) and StoppedOne
+    and RegValueExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'MyScribe') then
+    Exec(ExpandConstant('{app}\{#MyAppExe}'), '--at-login --no-browser --headless', '',
+      SW_HIDE, ewNoWait, Code);
+end;
+
+function InitializeUninstall(): Boolean;
+var
+  Code: Integer;
+begin
+  Result := True;
+  if RunStopScript(ExpandConstant('{app}\stop-myscribe.ps1'), Code) and (Code <> StopNothing)
+    and (Code <> StopDone) then
+  begin
+    SuppressibleMsgBox('MyScribe is still running and could not be stopped. Stop it - Settings > '
+      + 'Start at login > Stop MyScribe - and run the uninstaller again.', mbError, MB_OK, IDOK);
+    Result := False;
+  end;
+end;
 
 [Messages]
 ; SetupAppTitle is a message, not a [Setup] directive. iscc refused the

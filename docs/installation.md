@@ -187,7 +187,9 @@ prints nothing; what it did is in `MyScribe-launcher.log` beside
 
 **A release:** download the new file and install it over the old one. Your
 home, library and settings stay where they are; the next start updates the
-speech engine when the new version needs it.
+speech engine when the new version needs it. On Windows the installer stops a
+running MyScribe first - a job that was running starts over afterwards - and
+starts it again without a window when *Start at login* is on.
 
 **A clone:** `git pull`, then `python install.py`.
 
@@ -197,7 +199,8 @@ Uninstalling removes the program. Your library - recordings, transcripts,
 database, models and logs - always stays, wherever it is, and so does
 anything MyScribe installed for you from somebody else, such as Ollama.
 
-**Windows** - Settings > Apps > MyScribe > Uninstall removes
+**Windows** - Settings > Apps > MyScribe > Uninstall stops a running MyScribe,
+then removes
 `%LOCALAPPDATA%\Programs\MyScribe`, the shortcuts, and the login item if
 *Start at login* was on. It leaves:
 

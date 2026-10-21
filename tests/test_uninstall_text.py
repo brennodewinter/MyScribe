@@ -95,3 +95,28 @@ def test_the_readme_has_an_uninstalling_section_per_platform_and_documents_tools
     assert f"{autostart.LABEL}.plist" in section
     assert autostart.DESKTOP_NAME in section
     assert "`.tools/`" in readme and "python install.py` fetches it again" in readme
+
+
+# --- TASK-112.04: an update or uninstall stops a running MyScribe first ---------
+
+
+def test_the_stop_script_ships_in_the_install_folder():
+    """In `{app}`, because the uninstaller runs it from there; the installer
+    extracts the same entry to `{tmp}` before anything is replaced."""
+    files = _section(_iss(), "Files")
+    assert any('Source: "stop-myscribe.ps1"' in line and 'DestDir: "{app}"' in line for line in files), files
+    assert (ISS.parent / "stop-myscribe.ps1").exists()
+
+
+def test_an_update_and_an_uninstall_both_run_the_stop_script_first():
+    code = "\n".join(_section(_iss(), "Code"))
+    assert "function PrepareToInstall" in code and "ExtractTemporaryFile('stop-myscribe.ps1')" in code
+    assert "function InitializeUninstall" in code and r"{app}\stop-myscribe.ps1" in code
+
+
+def test_a_stopped_myscribe_with_its_login_item_on_comes_back_headless():
+    """The command the login item runs (ADR-026), and only when the item is
+    there: an update must not switch on a login start nobody chose."""
+    code = "\n".join(_section(_iss(), "Code"))
+    assert "'--at-login --no-browser --headless'" in code
+    assert r"RegValueExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'MyScribe')" in code
