@@ -36,7 +36,8 @@ PLATFORMS = ("windows-x64", "macos-arm64", "linux-x64")
 CACHE = REPO / "packaging" / ".cache"
 
 # What the app needs at run time, relative to the repository.
-APP_PATHS = ("scribe", "pyproject.toml", "uv.lock", ".env.example", "tests/fixtures/clip30.wav")
+APP_PATHS = ("scribe", "pyproject.toml", "uv.lock", ".env.example", "LICENSE.md",
+             "tests/fixtures/clip30.wav")
 
 
 def sha256(data: bytes) -> str:
@@ -115,6 +116,8 @@ def build(platform: str, out: Path, ffmpeg_dir: Path | None, models: bool = Fals
         target = app / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPO / rel, target)
+    # MyScribe's own licence beside the ones it ships for others (EUPL-1.2).
+    shutil.copy2(REPO / "LICENSE.md", licenses / "MyScribe-LICENSE-EUPL-1.2.md")
     for required in ("uv.lock", "pyproject.toml", "scribe/__main__.py", "tests/fixtures/clip30.wav"):
         if not (app / required).exists():
             raise SystemExit(f"payload is missing {required}; is it committed?")
