@@ -1365,6 +1365,21 @@ def test_correct_same_reaches_every_word_that_says_the_same_and_nothing_else(con
     assert glossary.same_word(conn, run_id, 0) == []
 
 
+def test_correct_same_teaches_the_glossary_once_not_per_occurrence(conn, monkeypatch):
+    """Every `correct_word` call used to run `learn_from_correction`, which
+    reads the whole glossary and scores the variant against it - N identical
+    lessons for a batch where every word says the same thing."""
+    media_id = seed.seed_media(conn, title="Guide")
+    run_id = seed.seed_run(conn, media_id, words=_words([" Ott", " ott,", " Ott.", " oTT"]))
+    lessons = []
+    monkeypatch.setattr(
+        glossary, "learn_from_correction", lambda conn, heard, typed: lessons.append(typed)
+    )
+
+    assert glossary.correct_same(conn, run_id, 0, "Otto") == 4
+    assert lessons == ["Otto"]
+
+
 def _words(texts):
     return [
         {"idx": i, "start": i * 0.5, "end": i * 0.5 + 0.4, "text": t, "probability": 0.9, "speaker": "SPEAKER_00"}

@@ -919,7 +919,9 @@ def _word_row(conn: sqlite3.Connection, run_id: int, idx: int) -> dict:
     return dict(row)
 
 
-def correct_word(conn: sqlite3.Connection, run_id: int, idx: int, text: str) -> str | None:
+def correct_word(
+    conn: sqlite3.Connection, run_id: int, idx: int, text: str, *, learn: bool = True
+) -> str | None:
     """Put ``text`` over word ``idx`` by hand; returns what the word now says.
 
     The typed text replaces the word's core only: the leading space Whisper
@@ -927,6 +929,11 @@ def correct_word(conn: sqlite3.Connection, run_id: int, idx: int, text: str) -> 
     typed over as "Vermeulen" becomes " Vermeulen,". An empty ``text`` takes
     the hand-made correction away and the word says what Whisper said - which
     is the restore path this layer promises (ADR-003), one row at a time.
+
+    ``learn=False`` is for `correct_same`, which puts one typed word over N
+    occurrences that all say the same thing: N identical lessons are N full
+    glossary scans for nothing, so the batch learns once and passes this to
+    the rest.
     """
     word = _word_row(conn, run_id, idx)
     core = text.strip()
@@ -947,7 +954,8 @@ def correct_word(conn: sqlite3.Connection, run_id: int, idx: int, text: str) -> 
             (run_id, idx, word["text"], corrected, RULE_MANUAL, time.time()),
         )
         conn.commit()
-    learn_from_correction(conn, word["text"], core)
+    if learn:
+        learn_from_correction(conn, word["text"], core)
     return corrected
 
 
@@ -1064,7 +1072,10 @@ def correct_same(conn: sqlite3.Connection, run_id: int, idx: int, text: str) -> 
     others = same_word(conn, run_id, idx)
     correct_word(conn, run_id, idx, core)
     for other in others:
-        correct_word(conn, run_id, int(other["idx"]), core)
+        # One lesson for the whole batch: `same_word` matched on the same
+        # core, so every occurrence teaches the glossary the same pair -
+        # and each teaching pass costs a full scan of it.
+        correct_word(conn, run_id, int(other["idx"]), core, learn=False)
     return 1 + len(others)
 
 
