@@ -1,4 +1,5 @@
 import os
+import stat
 from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("SCRIBE_DATA_DIR", Path(__file__).resolve().parent.parent / "data"))
@@ -79,6 +80,18 @@ def ensure_dirs() -> None:
         # to a group. The sensitive files inside an existing directory are
         # still tightened by their own writers (db.connect, applog).
         keep_private(DATA_DIR, 0o700)
+    elif os.name != "nt":
+        # GitHub #42: every library made before this fix sits at the umask's
+        # 0755, so media/ stays traversable and the recordings readable by
+        # anybody on the machine. No choice of the owner's needs "other" in
+        # here, so those bits go; the owner's and the group's stay. Once
+        # they are gone this is a stat and nothing more.
+        try:
+            mode = stat.S_IMODE(DATA_DIR.stat().st_mode)
+        except OSError:
+            return
+        if mode & 0o007:
+            keep_private(DATA_DIR, mode & ~0o007)
 
 
 def keep_private(path: Path, mode: int) -> None:
@@ -95,7 +108,10 @@ def keep_private(path: Path, mode: int) -> None:
     if os.name == "nt":
         return
     try:
-        os.chmod(path, mode)
+        # db.connect runs this on every connection: a file already right
+        # costs a stat, not a chmod (GitHub #42).
+        if stat.S_IMODE(os.stat(path).st_mode) != mode:
+            os.chmod(path, mode)
     except OSError:
         pass
 

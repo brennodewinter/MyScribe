@@ -31,21 +31,41 @@ def test_a_data_dir_the_app_makes_is_private(tmp_path, monkeypatch):
     assert stat.S_IMODE(data.stat().st_mode) == 0o700
 
 
-@pytest.mark.skipif(os.name == "nt", reason="mode bits are a POSIX answer; Windows has ACLs")
-def test_a_data_dir_the_app_did_not_make_keeps_its_mode(tmp_path, monkeypatch):
-    """A mode somebody chose on purpose is theirs: ensure_dirs must not
-    tighten it back at every start."""
+def _existing_data_dir(tmp_path, monkeypatch, mode):
     data = tmp_path / "existing"
-    data.mkdir(mode=0o755)
+    data.mkdir()
+    os.chmod(data, mode)  # mkdir's mode goes through the umask; chmod does not
     monkeypatch.setattr(paths, "DATA_DIR", data)
     monkeypatch.setattr(paths, "MEDIA_DIR", data / "media")
     monkeypatch.setattr(paths, "LOGS_DIR", data / "logs")
     monkeypatch.setattr(paths, "WORK_DIR", data / "work")
     monkeypatch.setattr(paths, "MODELS_DIR", data / "models")
+    return data
+
+
+@pytest.mark.skipif(os.name == "nt", reason="mode bits are a POSIX answer; Windows has ACLs")
+@pytest.mark.parametrize("mode", [0o750, 0o770, 0o700])
+def test_a_data_dir_opened_to_a_group_keeps_its_mode(tmp_path, monkeypatch, mode):
+    """A group somebody let in on purpose is theirs: ensure_dirs must not
+    tighten it back at every start."""
+    data = _existing_data_dir(tmp_path, monkeypatch, mode)
 
     paths.ensure_dirs()
 
-    assert stat.S_IMODE(data.stat().st_mode) == 0o755
+    assert stat.S_IMODE(data.stat().st_mode) == mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="mode bits are a POSIX answer; Windows has ACLs")
+@pytest.mark.parametrize("before, after", [(0o755, 0o750), (0o777, 0o770), (0o701, 0o700)])
+def test_an_existing_data_dir_stops_letting_everybody_in(tmp_path, monkeypatch, before, after):
+    """GitHub #42: every library made before this fix sits at the umask's
+    0755, so media/ stays traversable and the recordings world-readable.
+    The bits for "other" go; the owner's and the group's stay."""
+    data = _existing_data_dir(tmp_path, monkeypatch, before)
+
+    paths.ensure_dirs()
+
+    assert stat.S_IMODE(data.stat().st_mode) == after
 
 
 def test_each_job_gets_its_own_work_directory():
