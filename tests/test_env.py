@@ -484,13 +484,14 @@ def test_the_app_bootstraps_before_it_imports_the_app(monkeypatch):
     from scribe import __main__ as main_module
 
     order: list[str] = []
+    made = types.SimpleNamespace(state=types.SimpleNamespace())
 
     class App(types.ModuleType):
         def __getattr__(self, name):
             if name.startswith("__"):  # the import system asks for __path__ first
                 raise AttributeError(name)
             order.append(f"from scribe.app import {name}")
-            return lambda **kwargs: order.append("create_app")
+            return lambda **kwargs: order.append("create_app") or made
 
     class Server:
         def __init__(self, config):
@@ -508,6 +509,8 @@ def test_the_app_bootstraps_before_it_imports_the_app(monkeypatch):
     main_module.main(["--no-browser", "--no-supervisor", "--port", "4299"])
 
     assert order == ["bootstrap", "from scribe.app import create_app", "create_app", "run"]
+    # The stop route's way out (TASK-112.03): handed to the app before it runs.
+    assert callable(made.state.request_exit)
 
 
 # --- paths.refresh: the directory `.env` named ------------------------------------
