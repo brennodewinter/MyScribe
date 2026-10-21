@@ -38,6 +38,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import socket
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from html.parser import HTMLParser
@@ -45,7 +46,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from scribe import glossary
 
@@ -460,10 +461,9 @@ def is_local_host(host: str | None) -> bool:
     reserved - is local. A name is local when it is `localhost`, ends in
     `.localhost`, or ends in `.local` (mDNS: printers, NAS boxes). No host at
     all is local too: there is nothing public to fetch. Names are not
-    resolved, on purpose: a lookup inside a guard is a network call the guard
-    exists to prevent, and a name that resolves to a private address only
-    at fetch time is out of this guard's reach. It stops the author who
-    writes the address down, which is the case there is (TASK-072).
+    resolved *here* - that is `resolves_private`, and it runs at request
+    time, where redirect hops are judged too. This stays the cheap literal
+    check that refuses before any network is touched (TASK-072).
     """
     name = (host or "").strip().lower()
     if not name:
@@ -495,13 +495,92 @@ def ensure_public_http_url(url: str) -> str:
     return text
 
 
-def fetch_page(url: str, *, limit: int) -> tuple[str, str]:
+def resolves_private(host: str | None) -> bool:
+    """Does ``host`` resolve to an address outside the public internet?
+
+    The fetch-time half of `is_local_host`: the literal spelling is judged
+    before anything is fetched, but a public-looking name can resolve to a
+    private address, and checking it is only safe the moment the request is
+    actually made - which is why `public_only` calls this per request rather
+    than `ensure_public_http_url` calling it once.
+
+    A name that will not resolve answers False rather than refusing: it
+    reaches nothing either way, and the fetch's own "could not resolve host"
+    says the truer thing. A literal answers by `ipaddress` without a lookup.
+    """
+    name = (host or "").strip()
+    if not name:
+        return True
+    try:
+        return not ipaddress.ip_address(name).is_global
+    except ValueError:
+        pass
+    try:
+        answers = socket.getaddrinfo(name, None)
+    except OSError:
+        return False
+    return any(not ipaddress.ip_address(answer[4][0]).is_global for answer in answers)
+
+
+def _require_public_target(url: str) -> str:
+    """`ensure_public_http_url`, and the host must resolve publicly too."""
+    text = ensure_public_http_url(url)
+    if resolves_private(urlparse(text).hostname):
+        raise UnsupportedUrl(
+            f"{text} resolves to this machine or the local network; "
+            "a feed or playlist cannot ask for that"
+        )
+    return text
+
+
+def public_only(ydl) -> None:
+    """Restrict a `YoutubeDL` to fetching public http(s) URLs.
+
+    `ydl.urlopen` is the one call every request a `YoutubeDL` makes - each
+    redirect hop included - goes through, so wrapping it extends the
+    TASK-072 guard past the literal URL it checks: a feed's enclosure that
+    302s at this network is refused at the hop rather than after the fetch,
+    and a name that resolves privately is refused at the fetch rather than
+    only at the spelling. A resolver that answers differently at check time
+    and connect time can still race past; pinning the connection's own
+    lookup would close that, and urllib gives no way to.
+
+    A `ydl` with no `urlopen` has no network path to guard - the test seam
+    is built that way - and is left alone.
+    """
+    real_open = getattr(ydl, "urlopen", None)
+    if real_open is None:
+        return
+
+    def guarded(req, *args, **kwargs):
+        _require_public_target(req.full_url if isinstance(req, Request) else str(req))
+        return real_open(req, *args, **kwargs)
+
+    ydl.urlopen = guarded
+
+
+class _PublicRedirects(HTTPRedirectHandler):
+    """Judges every hop, not just the first: a public URL may not 302 home.
+
+    `redirect_request` is where urllib decides the next hop, so the check
+    lives there - refusing by raising, which urllib surfaces as an error on
+    the request rather than a redirect it followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _require_public_target(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_page(url: str, *, limit: int, public: bool = False) -> tuple[str, str]:
     """``(content_type, text)`` for ``url``, reading at most ``limit`` bytes.
 
     The one place discovery touches the network, and a seam the tests replace.
-    Deliberately small: no cookies, no rediression policy of our own, no
-    retry. A page that will not load in one try is a page whose podcast the
-    user can still reach by pasting the feed.
+    Deliberately small: no cookies, no retry. A page that will not load in one
+    try is a page whose podcast the user can still reach by pasting the feed.
+
+    ``public`` is for a page a feed pointed at rather than a person: the URL
+    itself and every redirect it answers with must stay outside this network.
     """
     request = Request(
         url,
@@ -510,7 +589,12 @@ def fetch_page(url: str, *, limit: int) -> tuple[str, str]:
             "Accept": _HTML_ACCEPT,
         },
     )
-    with urlopen(request, timeout=DISCOVERY_TIMEOUT) as response:  # noqa: S310 - scheme checked by the caller
+    if public:
+        _require_public_target(url)
+        open_url = build_opener(_PublicRedirects()).open
+    else:
+        open_url = urlopen
+    with open_url(request, timeout=DISCOVERY_TIMEOUT) as response:  # noqa: S310 - scheme checked by the caller
         content_type = response.headers.get_content_type()
         charset = response.headers.get_content_charset() or "utf-8"
         body = response.read(limit)
@@ -554,7 +638,12 @@ def feed_links(html: str) -> list[str]:
     return [parser.found[kind] for kind in FEED_LINK_TYPES if kind in parser.found]
 
 
-def discover_feed(page_url: str, *, fetch: Callable[..., tuple[str, str]] | None = None) -> str | None:
+def discover_feed(
+    page_url: str,
+    *,
+    fetch: Callable[..., tuple[str, str]] | None = None,
+    public: bool = False,
+) -> str | None:
     """The feed ``page_url`` announces, or None.
 
     A podcast home page is not something yt-dlp has an extractor for, but it
@@ -570,7 +659,9 @@ def discover_feed(page_url: str, *, fetch: Callable[..., tuple[str, str]] | None
     before anything touches it. Nothing here raises: a discovery that cannot
     answer returns None and lets the original failure stand.
     """
-    fetch = fetch or fetch_page
+    fetch = fetch or (
+        lambda url, *, limit: fetch_page(url, limit=limit, public=public)
+    )
     try:
         content_type, body = fetch(page_url, limit=MAX_DISCOVERY_BYTES)
     except Exception:  # noqa: BLE001 - discovery is a second chance, never a new failure
@@ -594,6 +685,7 @@ def probe(
     ydl=None,
     fetch: Callable[..., tuple[str, str]] | None = None,
     discover: bool = True,
+    public: bool = False,
 ) -> UrlInfo:
     """What this URL is, without downloading a byte.
 
@@ -610,16 +702,18 @@ def probe(
     """
     url = ensure_http_url(url)
     ydl = ydl if ydl is not None else build_ydl(probe_opts(cookies_file, limit=limit))
+    if public:
+        public_only(ydl)
     try:
         info = _extract(ydl, url, download=False)
     except UnsupportedUrl as unsupported:
         if not discover:
             raise
-        feed = discover_feed(url, fetch=fetch)
+        feed = discover_feed(url, fetch=fetch, public=public)
         if feed is None:
             raise
         try:
-            return probe(feed, cookies_file=cookies_file, limit=limit, ydl=ydl, discover=False)
+            return probe(feed, cookies_file=cookies_file, limit=limit, ydl=ydl, discover=False, public=public)
         except UrlError:
             # The feed was announced but is no better. The page is what the
             # user pasted and what they can act on, so its error is the one
@@ -662,6 +756,7 @@ def download(
     cookies_file: str | None = None,
     ydl=None,
     title_hint: str | None = None,
+    public: bool = False,
 ) -> DownloadedMedia:
     """Fetch the audio of one video into ``dest_dir``; returns where it landed.
 
@@ -693,6 +788,8 @@ def download(
 
     if ydl is None:
         ydl = build_ydl(download_opts(dest, cookies_file))
+    if public:
+        public_only(ydl)
     if on_progress is not None:
         ydl.add_progress_hook(_progress_hook(on_progress))
 

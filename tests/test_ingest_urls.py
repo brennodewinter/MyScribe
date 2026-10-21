@@ -26,11 +26,13 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import sys
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request
 
 import pytest
 
@@ -266,11 +268,95 @@ def test_a_non_http_url_never_reaches_yt_dlp():
 def test_an_address_a_feed_wrote_down_may_not_point_home(home):
     """TASK-072: a followed feed is polled unattended, and its author could
     publish an enclosure at this machine or its network and have the app
-    fetch it on their behalf. The written address is judged, not resolved."""
+    fetch it on their behalf. The written address is judged; resolution is
+    `resolves_private`'s job at request time."""
     with pytest.raises(urls.UnsupportedUrl) as exc:
         urls.ensure_public_http_url(home)
 
     assert "this machine or the local network" in str(exc.value)
+
+
+def test_a_public_name_that_resolves_home_is_local(monkeypatch):
+    """The guard the literal check cannot reach: a name is only judged by
+    what it resolves to once the lookup is actually due."""
+    monkeypatch.setattr(
+        urls.socket, "getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, 0, 0, "", ("192.168.1.1", 0))],
+    )
+    assert urls.resolves_private("cdn.example") is True
+
+
+def test_resolves_private(monkeypatch):
+    def no_lookup(*a, **k):
+        raise AssertionError("a literal needs no lookup")
+
+    monkeypatch.setattr(urls.socket, "getaddrinfo", no_lookup)
+    assert urls.resolves_private("127.0.0.1") is True
+    assert urls.resolves_private("8.8.8.8") is False
+    assert urls.resolves_private("") is True
+
+    def refuse(*a, **k):
+        raise socket.gaierror("no such host")
+
+    monkeypatch.setattr(urls.socket, "getaddrinfo", refuse)
+    assert urls.resolves_private("no-such-host.example") is False, (
+        "a name that will not resolve is the fetch's own failure, not the guard's"
+    )
+
+
+def test_a_redirect_that_points_home_is_refused_at_the_hop(monkeypatch):
+    """`public_only` wraps ydl.urlopen, the one call every request - each
+    redirect included - goes through, so a 302 home is refused mid-fetch."""
+    monkeypatch.setattr(
+        urls.socket, "getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))],
+    )
+
+    class Ydl:
+        def __init__(self):
+            self.urls = []
+
+        def urlopen(self, req, *args, **kwargs):
+            self.urls.append(req.full_url if isinstance(req, Request) else str(req))
+            return object()
+
+    ydl = Ydl()
+    urls.public_only(ydl)
+    ydl.urlopen(Request("https://cdn.example/episode.mp3"))
+    with pytest.raises(urls.UnsupportedUrl):
+        ydl.urlopen(Request("http://169.254.169.254/latest/meta-data"))
+    assert ydl.urls == ["https://cdn.example/episode.mp3"]
+
+
+def test_a_feed_jobs_fetch_runs_under_the_public_guard(conn, data_dir, monkeypatch):
+    """The `public` flag is what carries the guard from the literal URL the
+    stage checks into every request yt-dlp makes on its behalf."""
+    monkeypatch.setattr(
+        urls.socket, "getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))],
+    )
+    fake = FakeYdl(single_info())
+    fake.urlopen = lambda req, *a, **k: object()  # a network path to guard
+    monkeypatch.setattr(urls, "build_ydl", build_returning(fake))
+    job_id = url_job(conn, "https://cdn.example/episode.mp3", from_playlist=True)
+
+    url_stage.fetch(make_ctx(conn, job_id))
+
+    with pytest.raises(urls.UnsupportedUrl):
+        fake.urlopen(Request("http://127.0.0.1:11434/api/tags"))
+
+
+def test_a_personal_url_job_gets_no_public_guard(conn, data_dir, monkeypatch):
+    """A URL a person pasted is their own choice - the fetch-time guard is
+    the feed's constraint, not theirs."""
+    fake = FakeYdl(single_info())
+    fake.urlopen = lambda req, *a, **k: object()
+    monkeypatch.setattr(urls, "build_ydl", build_returning(fake))
+    job_id = url_job(conn, "https://cdn.example/episode.mp3")
+
+    url_stage.fetch(make_ctx(conn, job_id))
+
+    fake.urlopen(Request("http://127.0.0.1:11434/api/tags"))  # no guard, no raise
 
 
 @pytest.mark.parametrize("public", ["https://cdn.example/episode.mp3", "http://8.8.8.8/x.mp3"])
