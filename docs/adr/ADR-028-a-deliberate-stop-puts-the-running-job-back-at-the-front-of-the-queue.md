@@ -57,14 +57,18 @@ What happens today, read on `main` at 0331d47:
 
 * `Supervisor.stop` sets its stop event and leaves a running runner child
   alone (`scribe/supervisor.py:453`, `:609`).
-* The launcher then ends the app's process tree: taskkill on Windows, SIGTERM
-  and SIGKILL to the process group elsewhere
-  (`packaging/launcher/myscribe_launcher.py`, `AppProcess.stop`).
-* The runner has no SIGTERM handler, so it dies without a verdict and its row
-  stays `running`. The next start's `reconcile()` makes it `interrupted`
-  (`scribe/supervisor.py:309`).
-* The jobs board then says "Retry starts it over"; nothing runs it by itself.
-  A recording a watch folder took in waits until somebody sees it.
+* On Windows the launcher then ends the app's whole tree with taskkill
+  (`packaging/launcher/myscribe_launcher.py`, `AppProcess.stop`). The runner
+  dies without a verdict, its row stays `running`, and the next start's
+  `reconcile()` makes it `interrupted` (`scribe/supervisor.py:309`). The jobs
+  board then says "Retry starts it over"; nothing runs it by itself, so a
+  recording a watch folder took in waits until somebody sees it.
+* On macOS and Linux the launcher signals only the app's process group, and
+  the runner has a session of its own (`Supervisor._spawn`). Measured in WSL
+  on 2026-10-21: after SIGTERM to the app's group the app was gone and the
+  runner ran on, an orphan, and wrote `done` 13 s later. A real transcription
+  would hold the GPU (graphics processing unit) with no app to show it, and
+  the next start would wait for it.
 
 ## Decision Drivers
 
@@ -135,8 +139,9 @@ priority kept.
 ### Negative
 
 * The work done before the stop is redone: up to a whole transcription.
-* Only the stop route requeues. Window Quit, Ctrl+C and a SIGTERM still end
-  the job `interrupted`. Mitigation: the open question below.
+* Only the stop route requeues. Window Quit, Ctrl+C and a SIGTERM still
+  behave as today: `interrupted` on Windows, an orphaned runner that runs on
+  elsewhere. Mitigation: the open question below.
 
 ## Pros and Cons of the Options
 
@@ -163,7 +168,7 @@ priority kept.
 ## Open Questions
 
 - [x] What does a stop do to a running job? — **Answered 2026-10-21 by User: Robert van den Breemen:** it goes back to the queue (option A).
-- [ ] Should window Quit, Ctrl+C and a SIGTERM to the launcher also requeue, by going through the stop route?
+- [ ] Should window Quit, Ctrl+C and a SIGTERM to the launcher go through the stop route too, so they requeue on every OS and no runner outlives the app on macOS and Linux?
 
 ## Related Decisions
 

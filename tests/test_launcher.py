@@ -2658,7 +2658,7 @@ class _FakeServer:
     the way the real one does - or, with ``obeys=False``, answers and ignores
     the ask, the server the hard stop is for."""
 
-    def __init__(self, app_pid: int, on_stop, obeys: bool = True):
+    def __init__(self, app_pid: int, on_stop, obeys: bool = True, launcher_pid: int | None = None):
         self.posted: list[str] = []
         fake = self
 
@@ -2672,7 +2672,7 @@ class _FakeServer:
                 self.wfile.write(data)
 
             def do_GET(self):
-                self._answer(200, {"ok": True, "pid": app_pid, "launcher_pid": None})
+                self._answer(200, {"ok": True, "pid": app_pid, "launcher_pid": launcher_pid})
 
             def do_POST(self):
                 fake.posted.append(self.path)
@@ -2788,3 +2788,62 @@ def test_the_stop_flag_reaches_stop_running(monkeypatch, tmp_path):
 
     assert launcher.main(["--stop", "--port", "4299"]) == 0
     assert asked == [4299]
+
+
+_FAKE_LAUNCHER = """
+import os, signal, subprocess, sys, time
+marker = sys.argv[1]
+app = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                       start_new_session=sys.platform != "win32",
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def stop(*_):  # what run_headless does on SIGTERM: end the app's group, exit 0
+    os.killpg(app.pid, signal.SIGTERM)
+    app.wait(10)
+    open(marker, "w").write("0")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+print(os.getpid(), app.pid, flush=True)
+time.sleep(60)
+"""
+
+
+def _orphan_launcher(tmp_path) -> tuple[int, int, Path]:
+    """A launcher and its app, both nobody's child here, as `--stop` from
+    another shell finds them in production."""
+    script = tmp_path / "fake_launcher.py"
+    script.write_text(_FAKE_LAUNCHER, encoding="utf-8")
+    marker = tmp_path / "launcher-exit.txt"
+    out = tmp_path / "pids.txt"
+    spawn = ("import subprocess, sys; flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0); "
+             f"subprocess.Popen([sys.executable, {str(script)!r}, {str(marker)!r}], "
+             "start_new_session=sys.platform != 'win32', creationflags=flags, "
+             f"stdin=subprocess.DEVNULL, stdout=open({str(out)!r}, 'w'), stderr=subprocess.DEVNULL)")
+    _subprocess.run([sys.executable, "-c", spawn], check=True)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if out.exists() and len(out.read_text().split()) == 2:
+            break
+        time.sleep(0.1)
+    launcher_pid, app_pid = (int(n) for n in out.read_text().split())
+    return launcher_pid, app_pid, marker
+
+
+def test_the_hard_stop_ends_the_launcher_so_it_exits_clean_and_takes_its_app(tmp_path):
+    """Production's hard stop: /health names the launcher. Ending the
+    launcher - not the app under it - is what keeps a supervisor from
+    reading a crash and starting the server again (TASK-112.02)."""
+    launcher_pid, app_pid, marker = _orphan_launcher(tmp_path)
+    said: list = []
+    fake = _FakeServer(app_pid, lambda: None, obeys=False, launcher_pid=launcher_pid)
+    try:
+        code = launcher.stop_running(fake.port, lambda state, text: said.append(text), wait=1.0)
+    finally:
+        fake.close()
+        for pid in (app_pid, launcher_pid):
+            _end(pid)
+
+    assert code == 0
+    assert _gone(app_pid) and _gone(launcher_pid)
+    if sys.platform != "win32":  # taskkill /F gives a Windows launcher no handler to run
+        assert marker.read_text() == "0", "the launcher did not stop through its own handler"
+    assert any("interrupted" in text for text in said)

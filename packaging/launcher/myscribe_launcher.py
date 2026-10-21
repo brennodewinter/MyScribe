@@ -1357,7 +1357,14 @@ def wait_gone(pid: int, timeout: float) -> bool:
     return not pid_alive(pid)
 
 
-def end_tree(pid: int) -> None:
+LAUNCHER_STOP_WAIT = 2 * STOP_TIMEOUT + 10
+"""How long a launcher gets after SIGTERM before it is killed: its own
+`AppProcess.stop` may take two `STOP_TIMEOUT`s - SIGTERM, wait, SIGKILL,
+wait - over an app that hangs, which is the app the hard stop is for. Killing
+it sooner exits it non-zero, the restart signal of `APP_DIED`."""
+
+
+def end_tree(pid: int, grace: float = STOP_TIMEOUT) -> None:
     """End a process and what it started, the way `AppProcess.stop` does.
 
     Given the launcher's pid, POSIX sends it SIGTERM alone: its own handler
@@ -1372,7 +1379,7 @@ def end_tree(pid: int) -> None:
     try:
         kill, target = (os.killpg, pid) if os.getpgid(pid) == pid else (os.kill, pid)
         kill(target, signal.SIGTERM)
-        if not wait_gone(pid, STOP_TIMEOUT):
+        if not wait_gone(pid, grace):
             kill(target, signal.SIGKILL)
     except ProcessLookupError:
         pass
@@ -1410,7 +1417,10 @@ def stop_running(port: int, report: Callable[[str, str], None], wait: float = ST
             return 0
         report("busy", f"MyScribe did not stop within {wait:g} s; ending it.")
     launcher = health.get("launcher_pid")
-    end_tree(launcher if isinstance(launcher, int) else pid)
+    if isinstance(launcher, int) and pid_alive(launcher):
+        end_tree(launcher, grace=LAUNCHER_STOP_WAIT)
+    if pid_alive(pid):  # no launcher, or one that went without its app
+        end_tree(pid)
     if wait_gone(pid, STOP_TIMEOUT):
         report("status", "MyScribe was ended. A job that was running is marked interrupted; "
                          "Retry on the jobs page starts it over.")

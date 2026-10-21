@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-19 05:51'
-updated_date: '2026-10-21 05:57'
+updated_date: '2026-10-21 06:07'
 labels:
   - autostart
   - ux
@@ -52,6 +52,10 @@ Evidence (scratchpad):
 - Screenshots (ui-112.03/stop-card-before.png, stop-card-after.png) via headless Chrome CDP: the card before, and 'MyScribe is stopping. Job 1 was running: it is back at the front of the queue...' after; the job stayed queued. The upper card shows the real Run value of this machine, so the images stay out of the PR.
 - Pinned /health body test moved: two fields added (pid, launcher_pid).
 Not verified: the hard-stop path against the real app (tested with a fake server that ignores the route and an orphaned process); the launcher_pid path under a real launcher; macOS. Open in ADR-028: whether window Quit, Ctrl+C and SIGTERM should also requeue.
+
+Review follow-up:
+- Hard stop in production names a launcher_pid. end_tree now gives a launcher LAUNCHER_STOP_WAIT (2 x STOP_TIMEOUT + 10 s) before SIGKILL, because its own AppProcess.stop may take two STOP_TIMEOUTs over a hung app; then ends the app itself if it outlived the launcher. New test test_the_hard_stop_ends_the_launcher_so_it_exits_clean_and_takes_its_app (orphaned fake launcher + app): Windows 6 passed (stop tests), WSL test_launcher 135 passed 1 skipped. Not red first: the old code passes it too with a fast fake launcher; the >15 s timing is not under test.
+- Measured in WSL (scratchpad wsl-quit-runner.txt): SIGTERM to the app's group leaves the runner (own session) running; it wrote done 13 s later. ADR-028's context corrected: interrupted on Windows, an orphaned runner on POSIX.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
