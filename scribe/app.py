@@ -430,7 +430,8 @@ def create_app(
                 # signal, and nobody left to write a verdict.
                 if not supervisor.claim_is_fresh(row):
                     jobs.finish(conn, job_id, "cancelled")
-            elif not supervisor.runner_alive(row) or supervisor.kill_orphan(row["pid"]):
+            elif not supervisor.runner_alive(row) or supervisor.kill_orphan(
+                    row["pid"], job_started_at=row["started_at"]):
                 # Gone already, or a pid reused by a stranger, which is
                 # never signalled (GitHub #32); or ended just now.
                 jobs.finish(conn, job_id, "cancelled")
