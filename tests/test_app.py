@@ -4,6 +4,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -368,7 +369,8 @@ def test_a_shutdown_nobody_asked_for_does_not_requeue(stoppable):
 def test_the_stop_route_names_the_job_that_will_start_over(stoppable, conn):
     app, _asked = stoppable
     job_id = jobs.enqueue(conn, "transcribe")
-    conn.execute("UPDATE job SET status='running', started_at=1 WHERE id=?", (job_id,))
+    conn.execute("UPDATE job SET status='running', started_at=? WHERE id=?",
+                 (time.time(), job_id))  # a fresh claim: an old one is reconciled away (#29)
     conn.commit()
     with _loopback(app) as client:
         assert client.post("/api/shutdown").json()["running_job"] == job_id
@@ -409,8 +411,23 @@ def test_jobs_list_is_bounded_and_takes_a_limit(client, conn):
     assert rows[0]["id"] > rows[1]["id"]  # newest first
 
 
-def test_jobs_list_never_exceeds_the_ceiling(client, conn):
+def test_jobs_list_never_exceeds_the_ceiling(client, conn, monkeypatch):
+    """Seeded past the ceiling, or the clamp could be missing and this pass."""
+    import scribe.app as app_module
+
+    monkeypatch.setattr(app_module, "JOBS_LIST_LIMIT", 2)
     jobs.enqueue_many(conn, "fake", [{}] * 3)
 
     rows = client.get("/api/jobs", params={"limit": 10_000}).json()
-    assert len(rows) == 3  # clamped to JOBS_LIST_LIMIT, not an error
+    assert len(rows) == 2  # clamped to JOBS_LIST_LIMIT, not an error
+
+
+def test_cancel_ends_a_running_row_whose_claim_never_got_a_runner(client, conn):
+    """#29: no pid will ever be written, so there is nothing to signal and no
+    reason to keep the row running."""
+    job_id = jobs.enqueue(conn, "fake")
+    conn.execute("UPDATE job SET status='running', pid=NULL, started_at=? WHERE id=?",
+                 (1.0, job_id))
+    conn.commit()
+
+    assert client.post(f"/api/jobs/{job_id}/cancel").json()["status"] == "cancelled"

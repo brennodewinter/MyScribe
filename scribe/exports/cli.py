@@ -268,6 +268,9 @@ def open_database() -> sqlite3.Connection:
     conn = db.connect(path)
     with db.LOCK:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > db.SCHEMA_VERSION:
+        conn.close()
+        raise Refused(db.newer_schema(version))
     if version < db.SCHEMA_VERSION:
         conn.close()
         raise Refused(

@@ -380,6 +380,9 @@ def create_app(
 
     @app.get("/api/jobs")
     def list_jobs(request: Request, status: str | None = None, limit: int = 200) -> list[dict]:
+        """Jobs newest first: ``limit`` 1-1000, default 200, a filter by
+        ``status`` included; outside that range it is clamped, not refused
+        (GitHub #48)."""
         conn = request.app.state.conn
         # Newest first, and never the whole table: the board's own fragment
         # limits itself, and this endpoint answers polls - an unbounded read
@@ -421,8 +424,15 @@ def create_app(
         # the board said "cancelled" (jobs 127 and 129). Here the pid is known
         # and the answer is simple: end it.
         sup = getattr(request.app.state, "supervisor", None)
-        if row["status"] == "running" and row["pid"] and not (sup and sup.owns(job_id)):
-            if supervisor.kill_orphan(row["pid"]):
+        if row["status"] == "running" and not (sup and sup.owns(job_id)):
+            if row["pid"] is None:
+                # A claim whose runner never came (GitHub #29): nothing to
+                # signal, and nobody left to write a verdict.
+                if not supervisor.claim_is_fresh(row):
+                    jobs.finish(conn, job_id, "cancelled")
+            elif not supervisor.runner_alive(row) or supervisor.kill_orphan(row["pid"]):
+                # Gone already, or a pid reused by a stranger, which is
+                # never signalled (GitHub #32); or ended just now.
                 jobs.finish(conn, job_id, "cancelled")
         return _job_out(conn, _get_job(conn, job_id))
 
