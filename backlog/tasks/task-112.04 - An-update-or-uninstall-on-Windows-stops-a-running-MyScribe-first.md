@@ -4,8 +4,8 @@ title: An update or uninstall on Windows stops a running MyScribe first
 status: In Progress
 assignee:
   - '@claude'
-created_date: '2026-10-19 05:51'
-updated_date: '2026-10-21 18:41'
+created_date: 2026-10-19 05:51
+updated_date: '2026-10-21T19:14:00Z'
 labels:
   - packaging
   - autostart
@@ -50,4 +50,9 @@ Evidence (scratchpad):
 - Test install (test AppId, scratchpad folder, setup-112.04.log): a fake 0.8.x launcher (cmd copy + ping child) running from the target folder was ended before the files ('setup: Ending MyScribe.exe (process 13004) and what it started.'), Restart Manager then found nothing in use, and afterwards '{app}\MyScribe.exe --at-login --no-browser --headless' ran (the real Run value exists on this machine). The real MyScribe was not running (4242 silent).
 - Side effect, repaired: /GROUP was ignored (DisableProgramGroupPage=yes), so the test install rewrote the real Start menu shortcut MyScribe.lnk to the test folder. Restored its target, working dir and icon to %LOCALAPPDATA%\Programs\MyScribe\MyScribe.exe; test uninstall key and folder removed; real uninstall key and Run value untouched.
 Not verified: an uninstall at runtime (a test uninstall would delete the real Run value MyScribe; covered by text tests and the script tests only); AC4, a real release installer over a running 0.8.x; a real app requeueing through the installer (the route path was tested against a fake server).
+
+Release walk for Robert (agreed 2026-10-21), on the next release over the running 0.8.6, with Start at login on:
+A. Update (AC1, AC4): 1) Check 0.8.6 runs: curl -s http://127.0.0.1:4242/health shows version 0.8.6. 2) Run the new installer with a log: MyScribe-<version>-windows-x64-setup.exe /LOG=%TEMP%\myscribe-setup.log. 3) Afterwards: the log names stop-myscribe.ps1 and %LOCALAPPDATA%\MyScribe-launcher.log has 'setup: Ending MyScribe.exe (process N)'; Restart Manager reports no application in use. 4) /health answers with the new version, and no window opened (Get-Process MyScribe shows it). 5) The Run value now ends in --headless (TASK-112.01).
+B. Update over a new version with a job running (route path): queue a recording, run the installer again while it transcribes; MyScribe-launcher.log says 'asking it to stop', and after the install the job is queued again and starts over.
+C. Uninstall (AC2): while MyScribe runs, Settings > Apps > MyScribe > Uninstall. Afterwards: no MyScribe.exe or home python.exe from it runs, %LOCALAPPDATA%\Programs\MyScribe is gone, the Run value MyScribe is gone, and %LOCALAPPDATA%\MyScribe (the library) is still there. Reinstall afterwards to keep using it.
 <!-- SECTION:NOTES:END -->
