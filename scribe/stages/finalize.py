@@ -40,7 +40,7 @@ import sqlite3
 import time
 from typing import TYPE_CHECKING, Sequence
 
-from scribe import applog, db, jobs, paths
+from scribe import applog, db, jobs, media, paths
 
 if TYPE_CHECKING:  # avoids a runtime import cycle: runner imports this module
     from scribe.runner import RunnerContext
@@ -98,7 +98,7 @@ def run(ctx: "RunnerContext") -> None:
         )
 
     words = ctx.state.get("words") or []
-    duration = _media_duration(ctx)
+    duration = media.media_duration(ctx.conn, ctx.job.get("media_id"))
     measured = xrt(duration, _wall_seconds(ctx))
 
     # Read before _commit moves the flag: the names worth carrying over are the
@@ -692,17 +692,6 @@ def _wall_seconds(ctx: "RunnerContext") -> float:
     if not started:
         return 0.0
     return max(0.0, time.time() - float(started))
-
-
-def _media_duration(ctx: "RunnerContext") -> float:
-    """Seconds of media as probe recorded them; 0 when nobody knows."""
-    if not ctx.job.get("media_id"):
-        return 0.0
-    with db.LOCK:
-        row = ctx.conn.execute(
-            "SELECT duration FROM media WHERE id=?", (ctx.job["media_id"],)
-        ).fetchone()
-    return float(row["duration"]) if row is not None and row["duration"] else 0.0
 
 
 def _remove_work_dir(job_id: int) -> bool:

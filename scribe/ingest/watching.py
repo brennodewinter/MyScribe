@@ -1295,6 +1295,16 @@ def _default_observer():
     return Observer()
 
 
+def _identity(path: Path) -> tuple[int, int] | None:
+    """(device, inode) of a directory, or None where the system cannot say -
+    a file system that reports inode 0, or one that will not be asked."""
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino) if status.st_ino else None
+
+
 def _walk(root: Path) -> list[Path]:
     """Every candidate file under ``root``, hidden directories pruned.
 
@@ -1305,13 +1315,29 @@ def _walk(root: Path) -> list[Path]:
     found: list[Path] = []
     if not root.is_dir():
         return found
+    # Every directory once, by what it is rather than what it is called: a
+    # junction (no administrator needed on Windows, and not a link to
+    # os.walk) or a bind mount back into the tree made the walk emit the
+    # same files under ever longer prefixes, and one to a sibling took that
+    # sibling in twice (GitHub #40). os.stat follows the junction, so it
+    # answers with its target's identity.
+    seen: set[tuple[int, int]] = set()
+    if (rooted := _identity(root)) is not None:
+        seen.add(rooted)
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if not fsbrowse.is_hidden(here / name) and not in_data_dir(here / name)
-        ]
+        kept = []
+        for name in dirnames:
+            child = here / name
+            if fsbrowse.is_hidden(child) or in_data_dir(child):
+                continue
+            identity = _identity(child)
+            if identity is not None:
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            kept.append(name)
+        dirnames[:] = kept
         found.extend(
             here / name for name in filenames if is_candidate(here / name)
         )
