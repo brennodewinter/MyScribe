@@ -588,10 +588,17 @@ def public_only(ydl) -> None:
     `_public_urllib_handler` for why that handler and not the others.
 
     A resolver that answers differently at check time and connect time is
-    met by that handler too: it connects to the address it judged (see
-    `_guard_opener`). Two doors stay outside: a SOCKS or HTTP proxy, where
-    the proxy resolves the name, and a download yt-dlp hands to ffmpeg
-    (HLS/DASH), which opens its own connections.
+    met by that handler too: without a proxy it connects to the address it
+    judged (see `_guard_opener`). Behind a proxy that pin is off, and the
+    URL and redirect checks - by name - are the guard. What the connection
+    then reaches depends on the proxy: an HTTP proxy, and a socks4a or
+    socks5h one, looks the name up itself, an answer the guard never sees;
+    a socks4 or socks5 one is handed an address yt-dlp's SOCKS code looked
+    up locally, a second lookup the guard did not judge (GitHub #41).
+
+    Downloads stay inside yt-dlp, where the two layers above can see them:
+    see `_native_downloads_only`. ffmpeg still post-processes local files;
+    it is never handed a URL to fetch.
 
     A `ydl` with no `urlopen` has no network path to guard - the test seam
     is built that way - and is left alone. Guarding twice is a no-op: `probe`
@@ -612,7 +619,88 @@ def public_only(ydl) -> None:
             # Already built (a cached_property): close what it opened first.
             ydl._request_director.close()
         ydl._request_director = build_director([_public_urllib_handler()])
+    _native_downloads_only(ydl)
     ydl._scribe_public_only = True
+
+
+NATIVE_PROTOCOLS = frozenset(
+    {"http", "https", "m3u8", "m3u8_native", "http_dash_segments", "http_dash_segments_generator"}
+)
+"""The protocols yt-dlp's own downloaders fetch over plain http(s), through
+`ydl.urlopen`: a file, an HLS playlist and its segments, DASH segments."""
+
+
+def _not_held(url, by: str) -> UnsupportedUrl:
+    return UnsupportedUrl(
+        f"{url} would be fetched by {by}, which is not held to this app's "
+        "address checks; a feed or playlist cannot ask for that"
+    )
+
+
+def _native_downloads_only(ydl) -> None:
+    """Keep every download of a guarded ``ydl`` inside yt-dlp's own fetching.
+
+    yt-dlp gives HLS to ffmpeg by default, honours an ``external_downloader``
+    (aria2c, curl, ...), fetches rtmp with rtmpdump - and each of those opens
+    its own connections to the playlist, segment and key URLs, outside
+    `ydl.urlopen` and every check `public_only` makes. A feed's author writes
+    those URLs (GitHub #41). So, in three layers:
+
+    - every protocol is sent to yt-dlp's native downloader
+      (``external_downloader`` "native" - what ``hls_prefer_native`` became);
+    - a format whose protocol no native downloader fetches over http(s) -
+      rtmp, rtsp, mms, f4m - is refused by name before a downloader starts;
+    - an outside downloader yt-dlp still starts by itself is refused for this
+      ``ydl`` (`_outside_downloaders_refuse`): a live stream always goes to
+      ffmpeg, and the HLS downloader hands a playlist it cannot decrypt
+      (SAMPLE-AES) to ffmpeg whatever the options say.
+    """
+    params = getattr(ydl, "params", None)
+    if isinstance(params, dict):
+        params["external_downloader"] = {"default": "native"}
+    real_dl = getattr(ydl, "dl", None)
+    if real_dl is None:
+        return
+    _outside_downloaders_refuse()
+
+    def dl(name, info, *args, **kwargs):
+        from yt_dlp.utils import determine_protocol
+
+        for fmt in info.get("requested_formats") or [info]:
+            for protocol in determine_protocol(fmt).split("+"):
+                if protocol not in NATIVE_PROTOCOLS:
+                    raise _not_held(fmt.get("url"), f"an outside program ({protocol})")
+        return real_dl(name, info, *args, **kwargs)
+
+    ydl.dl = dl
+
+
+@functools.cache
+def _outside_downloaders_refuse() -> None:
+    """Make yt-dlp's outside downloaders refuse a ``ydl`` under `public_only`.
+
+    On the classes, because yt-dlp builds these downloaders itself, deep
+    inside a download (`HlsFD.real_download` constructs `FFmpegFD` directly).
+    Every one that starts a program comes through one of these two methods:
+    `ExternalFD` is ffmpeg, aria2c, curl, wget and the rest, `RtmpFD` is
+    rtmpdump. A ``ydl`` nobody guarded - a URL a person pasted - is let
+    through untouched. Built on first use, like `_public_urllib_handler`.
+    """
+    from yt_dlp.downloader.external import ExternalFD
+    from yt_dlp.downloader.rtmp import RtmpFD
+
+    for cls in (ExternalFD, RtmpFD):
+        cls.real_download = _refused_when_public(cls.real_download)
+
+
+def _refused_when_public(real_download):
+    def checked(self, filename, info_dict):
+        if getattr(self.ydl, "_scribe_public_only", False):
+            basename = getattr(self, "get_basename", None)
+            raise _not_held(info_dict.get("url"), basename() if basename else "rtmpdump")
+        return real_download(self, filename, info_dict)
+
+    return checked
 
 
 @functools.cache
@@ -689,8 +777,11 @@ def _guard_opener(opener):
     Its http(s) handlers connect through `_connect_checked` for the same
     reason: every hop opens its own connection, and that connection goes to
     the address that was judged. Not behind a proxy: the socket then goes to
-    the proxy, which may well live on this network, and the proxy does the
-    lookup - so there the URL and redirect checks are the whole guard.
+    the proxy, which may well live on this network, so there the URL and
+    redirect checks are the whole guard. An HTTP, socks4a or socks5h proxy
+    looks the name up itself; for socks4 and socks5 yt-dlp's SOCKS code
+    (`yt_dlp.socks`) looks it up here, at connect time, in a lookup of its
+    own that this pin does not reach (GitHub #41).
     """
     for handler in opener.handlers:
         if isinstance(handler, HTTPRedirectHandler):
@@ -702,7 +793,14 @@ def _guard_opener(opener):
 
 def _judging_hops(redirect_request):
     def judged(req, fp, code, msg, headers, newurl):
-        _require_public_target(newurl)
+        try:
+            _require_public_target(newurl)
+        except UrlError:
+            # urllib reads and closes the 302's body only once this returns;
+            # raising past that would leave its socket open until GC.
+            if fp is not None:
+                fp.close()
+            raise
         return redirect_request(req, fp, code, msg, headers, newurl)
 
     return judged
@@ -712,6 +810,9 @@ def _connecting_checked(do_open):
     def opened(http_class, req, **kwargs):
         def connection(*args, **conn_kwargs):
             conn = http_class(*args, **conn_kwargs)
+            # A SOCKS proxy passes this test - yt-dlp carries it in a header,
+            # not as a urllib proxy - and its connection class ignores
+            # `_create_connection`, so the assignment is harmless there.
             if not (req.has_proxy() or req._tunnel_host):
                 conn._create_connection = _connect_checked
             return conn

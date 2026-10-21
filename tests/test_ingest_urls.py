@@ -40,7 +40,7 @@ from urllib.request import Request
 import pytest
 
 from scribe import db, doctor, jobs, media, paths, runner
-from scribe.ingest import urls
+from scribe.ingest import feeds, urls
 from scribe.stages import transcribe, url_stage
 from scribe.web import jobs_ui
 
@@ -367,7 +367,10 @@ def redirect_home(monkeypatch):
     name ``feeds.test`` resolves to 127.0.0.1 and the guard's resolver is
     told it is public. The redirect target is the literal 127.0.0.1 of a
     second server, which nothing allow-lists - a hit there is the leak.
-    ``/ok`` answers 200, to show the guarded fetch still fetches.
+    ``/ok`` answers 200, to show the guarded fetch still fetches. The two
+    ``.m3u8`` paths are HLS playlists whose key and segment live on the
+    trap: ``/plain.m3u8`` is one yt-dlp fetches itself, ``/sample-aes.m3u8``
+    one it would hand to ffmpeg.
     """
     origin_hits: list[str] = []
     trap_hits: list[str] = []
@@ -385,15 +388,33 @@ def redirect_home(monkeypatch):
             pass
 
     trap = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trap)
-    trap_url = f"http://127.0.0.1:{trap.server_address[1]}/latest/meta-data"
+    trap_root = f"http://127.0.0.1:{trap.server_address[1]}"
+    trap_url = f"{trap_root}/latest/meta-data"
+
+    def playlist(key: str) -> bytes:
+        return (
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n"
+            "#EXT-X-MEDIA-SEQUENCE:0\n"
+            f"{key}"
+            f"#EXTINF:10.0,\n{trap_root}/segment.ts\n#EXT-X-ENDLIST\n"
+        ).encode()
+
+    served = {
+        "/ok": ("application/rss+xml", b"<rss/>"),
+        "/plain.m3u8": ("application/vnd.apple.mpegurl", playlist("")),
+        "/sample-aes.m3u8": (
+            "application/vnd.apple.mpegurl",
+            playlist(f'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{trap_root}/key"\n'),
+        ),
+    }
 
     class Origin(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             origin_hits.append(self.path)
-            if self.path == "/ok":
-                body = b"<rss/>"
+            if self.path in served:
+                content_type, body = served[self.path]
                 self.send_response(200)
-                self.send_header("Content-Type", "application/rss+xml")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -583,7 +604,196 @@ def test_a_personal_url_job_gets_no_public_guard(conn, data_dir, monkeypatch):
     fake.urlopen(Request("http://127.0.0.1:11434/api/tags"))  # no guard, no raise
 
 
-@pytest.mark.parametrize("public", ["https://cdn.example/episode.mp3", "http://8.8.8.8/x.mp3"])
+def _followed(conn, url: str, **kwargs) -> dict:
+    feed_id = feeds.subscribe(conn, url, **kwargs)
+    return next(feed for feed in feeds.all_feeds(conn) if feed["id"] == feed_id)
+
+
+def test_a_followed_feeds_poll_never_follows_its_document_home(conn, redirect_home):
+    """GitHub #41 names the feed document itself: the timer polls it with
+    nobody watching, so a feed that turns hostile and 302s its own document
+    at this machine fails the poll - recorded like any other failure -
+    instead of the app reading the answer. A real yt-dlp, a real 302."""
+    feed = _followed(conn, redirect_home.base + "/feed.xml", answered=True)
+
+    out = feeds.poll(
+        conn, feed, probe=urls.probe, known_sources=lambda c, e: [None] * len(e), options={},
+    )
+
+    assert redirect_home.trap_hits == []
+    assert redirect_home.origin_hits, "the feed was never polled"
+    assert HOP_REFUSED in out["error"]
+    row = conn.execute("SELECT failures FROM feed WHERE id=?", (feed["id"],)).fetchone()
+    assert row["failures"] == 1
+
+
+def test_answering_a_feeds_question_never_follows_its_document_home(conn, redirect_home):
+    """The back-catalogue answer reads the feed again, from the address it
+    was followed at - the feed's word by then, not the person's (GitHub #41)."""
+    feed = _followed(conn, redirect_home.base + "/feed.xml")
+
+    with pytest.raises(urls.UrlError, match=HOP_REFUSED):
+        feeds.backfill(
+            conn, feed, "all",
+            probe=urls.probe, known_sources=lambda c, e: [None] * len(e), options={},
+        )
+
+    assert redirect_home.origin_hits, "the feed was never read"
+    assert redirect_home.trap_hits == []
+
+
+NOT_HELD = "not held to this app's address checks"
+"""What the guard says when a download would leave yt-dlp's own fetching."""
+
+
+class Spawned(Exception):
+    """An outside downloader was about to start."""
+
+
+@pytest.fixture
+def spawned(monkeypatch):
+    """Every outside program yt-dlp's downloaders would start, refused.
+
+    ffmpeg, rtmpdump, aria2c and the rest are started through the `Popen` of
+    these two modules. Recording the attempt rather than letting it run keeps
+    the test the same on a machine with or without ffmpeg: ffmpeg resolves
+    names through the OS, past the test's allow-list, and would fail for the
+    wrong reason.
+    """
+    started: list = []
+
+    class Recorder:
+        def __init__(self, *args, **kwargs):
+            started.append(args)
+            raise Spawned(args)
+
+        @classmethod
+        def run(cls, *args, **kwargs):
+            started.append(args)
+            raise Spawned(args)
+
+    import yt_dlp.downloader.external as external
+    import yt_dlp.downloader.rtmp as rtmp
+
+    monkeypatch.setattr(external, "Popen", Recorder)
+    monkeypatch.setattr(rtmp, "Popen", Recorder)
+    return started
+
+
+@pytest.mark.parametrize("asked", [None, "ffmpeg"])
+@pytest.mark.parametrize("protocol", ["http", "https", "m3u8", "m3u8_native", "http_dash_segments"])
+def test_a_feeds_download_never_chooses_an_outside_downloader(tmp_path, protocol, asked):
+    """GitHub #41: yt-dlp hands HLS to ffmpeg by default, and ffmpeg fetches
+    the playlist and every segment itself, outside `ydl.urlopen` and the
+    guard. Under `public_only` every protocol it is allowed to fetch goes to
+    a downloader of its own - even when the options asked for ffmpeg."""
+    from yt_dlp.downloader import get_suitable_downloader
+    from yt_dlp.downloader.external import ExternalFD
+
+    opts = urls.download_opts(tmp_path)
+    if asked:
+        opts["external_downloader"] = {"default": asked}
+    ydl = urls.build_ydl(opts)
+    urls.public_only(ydl)
+
+    info = {"url": "https://cdn.example/episode", "protocol": protocol, "ext": "mp4"}
+    chosen = get_suitable_downloader(info, ydl.params)
+
+    assert not issubclass(chosen, ExternalFD), chosen
+
+
+@pytest.mark.parametrize(
+    "info",
+    [
+        {"protocol": "rtmp", "url": "rtmp://127.0.0.1:9/live"},
+        {"protocol": "rtsp", "url": "rtsp://127.0.0.1:9/stream"},
+        {"protocol": "mms", "url": "mms://127.0.0.1:9/stream"},
+        {"protocol": "f4m", "url": "http://127.0.0.1:9/manifest.f4m"},
+        {"protocol": "m3u8_native", "url": "http://127.0.0.1:9/live.m3u8", "is_live": True},
+    ],
+    ids=["rtmp", "rtsp", "mms", "f4m", "live-hls"],
+)
+def test_a_feeds_download_refuses_what_only_an_outside_program_would_fetch(
+    tmp_path, spawned, info
+):
+    """The protocols yt-dlp's own downloaders cannot fetch over plain http(s)
+    - and a live stream, which yt-dlp always gives to ffmpeg - are refused by
+    name, before any downloader is started (GitHub #41)."""
+    ydl = urls.build_ydl(urls.download_opts(tmp_path))
+    urls.public_only(ydl)
+
+    with pytest.raises(urls.UrlError, match=NOT_HELD):
+        ydl.dl(str(tmp_path / "episode.mp4"), {**info, "id": "x", "title": "x", "ext": "mp4"})
+
+    assert spawned == []
+
+
+def test_a_pasted_urls_download_may_still_use_ffmpeg(tmp_path, monkeypatch):
+    """The refusal lives on yt-dlp's downloader classes, so it must ask whose
+    download it is: a guarded YoutubeDL in the same process may not take
+    ffmpeg away from a URL a person pasted. ffmpeg's own start is replaced,
+    so the answer is the same whether this machine has ffmpeg or not."""
+    from yt_dlp.downloader.external import FFmpegFD
+
+    def call_downloader(self, tmpfilename, info_dict):
+        raise Spawned(info_dict["url"])
+
+    monkeypatch.setattr(FFmpegFD, "_call_downloader", call_downloader)
+    urls.public_only(urls.build_ydl(urls.download_opts(tmp_path)))  # the classes are patched now
+    ydl = urls.build_ydl(urls.download_opts(tmp_path))
+    live = {"protocol": "m3u8_native", "url": "https://cdn.example/live.m3u8", "is_live": True}
+
+    with pytest.raises(Spawned, match="live.m3u8"):
+        ydl.dl(str(tmp_path / "episode.mp4"), {**live, "id": "x", "title": "x", "ext": "mp4"})
+
+
+@pytest.mark.parametrize(
+    ("path", "refused"),
+    [("/plain.m3u8", "points at this machine"), ("/sample-aes.m3u8", NOT_HELD)],
+    ids=["native", "would-be-ffmpeg"],
+)
+def test_a_feeds_hls_playlist_never_fetches_a_segment_at_home(
+    redirect_home, tmp_path, spawned, path, refused
+):
+    """A real playlist through a real yt-dlp. The plain one is fetched by
+    yt-dlp itself, so its segment request meets the guard. SAMPLE-AES is a
+    key method yt-dlp cannot decrypt, so it hands the whole playlist to
+    ffmpeg - the playlist author's way past the guard (GitHub #41). Both
+    must fail without the segment or key on this machine being asked for."""
+    with pytest.raises(urls.UrlError, match=refused):
+        urls.download(redirect_home.base + path, tmp_path / "work", public=True)
+
+    assert path in redirect_home.origin_hits
+    assert spawned == []
+    assert redirect_home.trap_hits == []
+
+
+def test_a_refused_hop_closes_the_response_it_refused():
+    """urllib reads and closes a 302's body only after `redirect_request`
+    returns; a refusal raised from inside it left the socket open until the
+    garbage collector came by."""
+    from urllib.request import HTTPRedirectHandler, build_opener
+
+    opener = urls._guard_opener(build_opener())
+    handler = next(h for h in opener.handlers if isinstance(h, HTTPRedirectHandler))
+
+    class Body:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    body = Body()
+    with pytest.raises(urls.UnsupportedUrl):
+        handler.redirect_request(
+            Request("https://cdn.example/feed.xml"), body, 302, "Found", {},
+            "http://169.254.169.254/latest/meta-data",
+        )
+
+    assert body.closed
+
+
+@pytest.mark.parametrize("public",["https://cdn.example/episode.mp3", "http://8.8.8.8/x.mp3"])
 def test_a_public_address_from_a_feed_passes(public):
     assert urls.ensure_public_http_url(public) == public
 
