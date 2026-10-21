@@ -436,3 +436,67 @@ def test_the_private_column_defaults_to_public_for_existing_rows(conn):
         row = conn.execute("SELECT private FROM media WHERE id=?", (media_id,)).fetchone()
     assert row["private"] == 0
     assert privacy.is_private(conn, media_id) is False
+
+
+def test_chat_closes_the_provider_it_built(conn, monkeypatch):
+    """A provider holds a connection pool; one chat() per question leaking
+    one pool each is a slow leak on the pages that get used most."""
+    closed = []
+
+    class Trackable(base.Provider):
+        name = "trackable"
+        is_local = True
+
+        def __init__(self, conn, **kwargs):
+            pass
+
+        def available(self):
+            return True, ""
+
+        def models(self):
+            return ["m"]
+
+        def complete(self, req):
+            return base.ChatResponse(text="hi", model="m", provider=self.name)
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setitem(llm.PROVIDERS, "trackable", Trackable)
+    media_id = seed_media(conn)
+
+    answer = llm.chat(conn, media_id=media_id, provider_name="trackable", request=REQUEST)
+
+    assert answer.text == "hi" and closed == [True]
+
+
+def test_chat_closes_the_provider_even_when_it_fails(conn, monkeypatch):
+    closed = []
+
+    class Failing(base.Provider):
+        name = "failing"
+        is_local = True
+
+        def __init__(self, conn, **kwargs):
+            pass
+
+        def available(self):
+            return True, ""
+
+        def models(self):
+            return ["m"]
+
+        def complete(self, req):
+            raise base.Unreachable("down")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setitem(llm.PROVIDERS, "failing", Failing)
+    media_id = seed_media(conn)
+
+    with pytest.raises(base.LlmError):
+        llm.chat(conn, media_id=media_id, provider_name="failing", request=REQUEST,
+                 attempts=1, sleep=lambda s: None)
+
+    assert closed == [True]

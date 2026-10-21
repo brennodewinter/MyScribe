@@ -15,13 +15,14 @@ import os
 import re
 import subprocess
 import sys
+import time
 import textwrap
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from scribe import db, doctor, fsbrowse, jobs, paths, runner
+from scribe import db, doctor, fsbrowse, jobs, llm, paths, runner
 from scribe.app import create_app
 from scribe.web import settings as settings_ui
 
@@ -1123,7 +1124,8 @@ def test_the_stop_card_says_what_happens_to_a_running_job(client):
 
 def test_the_stop_button_stops_and_names_the_job_that_starts_over(stoppable_client, conn):
     job_id = jobs.enqueue(conn, "transcribe")
-    conn.execute("UPDATE job SET status='running', started_at=1 WHERE id=?", (job_id,))
+    conn.execute("UPDATE job SET status='running', started_at=? WHERE id=?",
+                 (time.time(), job_id))  # a fresh claim: an old one is reconciled away (#29)
     conn.commit()
 
     response = stoppable_client.post("/settings/stop", headers=HX)
@@ -1137,3 +1139,17 @@ def test_the_stop_button_stops_and_names_the_job_that_starts_over(stoppable_clie
 def test_the_stop_button_from_another_site_is_refused(stoppable_client):
     response = stoppable_client.post("/settings/stop", headers={**HX, "Sec-Fetch-Site": "cross-site"})
     assert response.status_code == 403 and stoppable_client.asked == []
+
+
+def test_the_provider_can_be_un_chosen(client, conn):
+    """"No provider" is a state the settings row can express (`default_provider`
+    answers "" for it), so the form must be able to write it - a select with
+    no empty option could not."""
+    from scribe.web import ai_ui
+
+    ai_ui.setting_put(conn, ai_ui.PROVIDER_SETTING, "ollama")
+    assert llm.default_provider(conn) == "ollama"
+
+    resp = client.post("/settings/llm", data={"provider": ""})
+    assert resp.status_code == 200
+    assert llm.default_provider(conn) == ""

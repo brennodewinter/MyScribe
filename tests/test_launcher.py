@@ -2847,3 +2847,27 @@ def test_the_hard_stop_ends_the_launcher_so_it_exits_clean_and_takes_its_app(tmp
     if sys.platform != "win32":  # taskkill /F gives a Windows launcher no handler to run
         assert marker.read_text() == "0", "the launcher did not stop through its own handler"
     assert any("interrupted" in text for text in said)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_a_group_of_only_zombies_does_not_make_stop_raise(layout, monkeypatch):
+    """macOS answers killpg on a group whose members have all exited but are
+    not yet reaped with EPERM, not ESRCH - and the SIGKILL for stragglers is
+    sent after the app has gone. That surfaced as a PermissionError out of
+    Quit on a hosted macOS runner."""
+    child = _subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              start_new_session=True)
+    app = launcher.AppProcess(layout, _free_port())
+    app.proc = child
+    real_killpg = os.killpg
+
+    def killpg(group, sig):
+        if sig == _signal.SIGKILL:
+            raise PermissionError(1, "Operation not permitted")
+        real_killpg(group, sig)
+
+    monkeypatch.setattr(launcher.os, "killpg", killpg)
+
+    app.stop(timeout=10)
+
+    assert child.poll() is not None

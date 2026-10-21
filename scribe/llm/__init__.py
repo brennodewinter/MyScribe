@@ -159,7 +159,13 @@ def chat(
     privacy.assert_allowed(conn, media_id, cls)
 
     provider = cls(conn, **provider_kwargs)
-    return with_retry(lambda: provider.complete(request), attempts=attempts, sleep=sleep)
+    try:
+        return with_retry(lambda: provider.complete(request), attempts=attempts, sleep=sleep)
+    finally:
+        # Every provider is closed, whatever the outcome: the clients hold a
+        # connection pool, and one chat() per question leaking one pool each
+        # is a slow leak on exactly the pages that get used most.
+        provider.close()
 
 
 __all__ = [

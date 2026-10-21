@@ -1365,6 +1365,21 @@ def test_correct_same_reaches_every_word_that_says_the_same_and_nothing_else(con
     assert glossary.same_word(conn, run_id, 0) == []
 
 
+def test_correct_same_teaches_the_glossary_once_not_per_occurrence(conn, monkeypatch):
+    """Every `correct_word` call used to run `learn_from_correction`, which
+    reads the whole glossary and scores the variant against it - N identical
+    lessons for a batch where every word says the same thing."""
+    media_id = seed.seed_media(conn, title="Guide")
+    run_id = seed.seed_run(conn, media_id, words=_words([" Ott", " ott,", " Ott.", " oTT"]))
+    lessons = []
+    monkeypatch.setattr(
+        glossary, "learn_from_correction", lambda conn, heard, typed: lessons.append(typed)
+    )
+
+    assert glossary.correct_same(conn, run_id, 0, "Otto") == 4
+    assert lessons == ["Otto"]
+
+
 def _words(texts):
     return [
         {"idx": i, "start": i * 0.5, "end": i * 0.5 + 0.4, "text": t, "probability": 0.9, "speaker": "SPEAKER_00"}
@@ -1418,3 +1433,13 @@ def test_a_user_s_own_term_outranks_the_built_in_name(conn):
 
     (row,) = glossary.stored(conn, run_id)
     assert row["rule"] != glossary.RULE_BUILT_IN
+
+
+def test_same_word_matches_beyond_ascii_case(conn):
+    """#50: the match moved into SQL, where LOWER() folds ASCII only - the
+    predicate there is this module's own casefold, so Ø and ß still match."""
+    media_id = seed.seed_media(conn, title="Guide")
+    run_id = seed.seed_run(conn, media_id, words=_words(
+        [" Ørsted", " en", " ØRSTED,", " Straße", " ørsted.", " Orsted"]))
+
+    assert [w["idx"] for w in glossary.same_word(conn, run_id, 0)] == [2, 4]

@@ -1381,8 +1381,8 @@ def end_tree(pid: int, grace: float = STOP_TIMEOUT) -> None:
         kill(target, signal.SIGTERM)
         if not wait_gone(pid, grace):
             kill(target, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    except (ProcessLookupError, PermissionError):
+        pass  # gone, or a macOS group of unreaped members (EPERM)
 
 
 def stop_running(port: int, report: Callable[[str, str], None], wait: float = STOP_WAIT) -> int:
@@ -1513,7 +1513,9 @@ class AppProcess:
             pass
         try:
             os.killpg(group, signal.SIGKILL)  # stragglers: a runner mid-model-load
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # Gone, or - macOS - a group of exited members not yet reaped,
+            # which answers EPERM rather than ESRCH.
             pass
         self.proc.wait(timeout)
 
