@@ -24,13 +24,16 @@ bite in the field:
 
 from __future__ import annotations
 
+import http.server
 import json
 import re
 import socket
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request
 
@@ -354,6 +357,124 @@ def test_the_guard_reads_the_url_of_a_real_yt_dlp_request(monkeypatch):
     with pytest.raises(urls.UnsupportedUrl):
         ydl.urlopen(YtdlpRequest("http://169.254.169.254/latest/meta-data"))
     assert opened == [public, "https://cdn.example/feed.xml"]
+
+
+@pytest.fixture
+def redirect_home(monkeypatch):
+    """A feed host that answers 302 to an address on this machine.
+
+    Both servers listen on loopback, so the guard needs one exception: the
+    name ``feeds.test`` resolves to 127.0.0.1 and the guard's resolver is
+    told it is public. The redirect target is the literal 127.0.0.1 of a
+    second server, which nothing allow-lists - a hit there is the leak.
+    ``/ok`` answers 200, to show the guarded fetch still fetches.
+    """
+    origin_hits: list[str] = []
+    trap_hits: list[str] = []
+
+    class Trap(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            trap_hits.append(self.path)
+            body = b"the metadata service"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    trap = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trap)
+    trap_url = f"http://127.0.0.1:{trap.server_address[1]}/latest/meta-data"
+
+    class Origin(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            origin_hits.append(self.path)
+            if self.path == "/ok":
+                body = b"<rss/>"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/rss+xml")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(302)
+            self.send_header("Location", trap_url)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+    for server in (trap, origin):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        if host == "feeds.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", int(port or 0)))]
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    real_resolves_private = urls.resolves_private
+    monkeypatch.setattr(urls.socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(
+        urls, "resolves_private",
+        lambda host, *rest: host != "feeds.test" and real_resolves_private(host, *rest),
+    )
+    try:
+        yield SimpleNamespace(
+            base=f"http://feeds.test:{origin.server_address[1]}",
+            origin_hits=origin_hits,
+            trap_hits=trap_hits,
+        )
+    finally:
+        for server in (trap, origin):
+            server.shutdown()
+            server.server_close()
+
+
+def test_a_feed_page_that_redirects_home_is_refused_at_the_hop(redirect_home):
+    """GitHub #41: discovery's own fetch judges every redirect it is told to
+    follow, against a real 302 - not only the URL it was handed."""
+    assert urls.fetch_page(redirect_home.base + "/ok", limit=1000, public=True) == (
+        "application/rss+xml", "<rss/>",
+    )
+
+    with pytest.raises(urls.UnsupportedUrl, match="local network"):
+        urls.fetch_page(redirect_home.base + "/feed", limit=1000, public=True)
+
+    assert redirect_home.origin_hits == ["/ok", "/feed"]
+    assert redirect_home.trap_hits == []
+
+
+def test_a_followed_feeds_redirect_home_is_refused_at_the_hop(redirect_home):
+    """GitHub #41: yt-dlp follows redirects inside its request handlers, past
+    the urlopen the guard wraps - so the guarded YoutubeDL must see each hop.
+    A real YoutubeDL against a real 302: the origin is reached, the address
+    it points at on this machine is not."""
+    from yt_dlp.networking.exceptions import RequestError
+
+    ydl = urls.build_ydl(urls.probe_opts())
+    urls.public_only(ydl)
+
+    assert ydl.urlopen(redirect_home.base + "/ok").read() == b"<rss/>"
+    with pytest.raises(RequestError, match="local network"):
+        ydl.urlopen(redirect_home.base + "/feed")
+
+    assert redirect_home.origin_hits == ["/ok", "/feed"]
+    assert redirect_home.trap_hits == []
+
+
+def test_a_followed_feeds_probe_never_reaches_the_redirect_target(redirect_home):
+    """The same hop through the stage's own call: `probe(public=True)` with
+    the real yt-dlp fails, and fails without touching this machine."""
+    with pytest.raises(urls.UrlError, match="local network"):
+        urls.probe(redirect_home.base + "/episode.mp3", public=True, discover=False)
+
+    assert redirect_home.origin_hits
+    assert redirect_home.trap_hits == []
 
 
 def test_a_feed_jobs_fetch_runs_under_the_public_guard(conn, data_dir, monkeypatch):

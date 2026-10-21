@@ -35,6 +35,7 @@ needs.
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import os
 import re
@@ -536,20 +537,27 @@ def _require_public_target(url: str) -> str:
 def public_only(ydl) -> None:
     """Restrict a `YoutubeDL` to fetching public http(s) URLs.
 
-    `ydl.urlopen` is the one call every request a `YoutubeDL` makes - each
-    redirect hop included - goes through, so wrapping it extends the
-    TASK-072 guard past the literal URL it checks: a feed's enclosure that
-    302s at this network is refused at the hop rather than after the fetch,
-    and a name that resolves privately is refused at the fetch rather than
-    only at the spelling. A resolver that answers differently at check time
-    and connect time can still race past; pinning the connection's own
-    lookup would close that, and urllib gives no way to.
+    Two layers, because yt-dlp has two places a URL enters. `ydl.urlopen` is
+    the call every request a `YoutubeDL` *starts* goes through, so wrapping it
+    judges each URL an extractor or downloader asks for - the literal
+    spelling and what the name resolves to - before anything is sent.
+
+    Redirects do not come back through it: urlopen hands the request to a
+    request handler once, and the handler follows any 302 itself (GitHub
+    #41). So the `YoutubeDL` also gets a request director holding a single
+    handler, yt-dlp's urllib one, whose redirect step judges every hop - see
+    `_public_urllib_handler` for why that handler and not the others.
+
+    A resolver that answers differently at check time and connect time can
+    still race past these checks; pinning the connection to the address that
+    was checked would close that.
 
     A `ydl` with no `urlopen` has no network path to guard - the test seam
-    is built that way - and is left alone.
+    is built that way - and is left alone. Guarding twice is a no-op: `probe`
+    passes the same `ydl` on when it retries with a discovered feed.
     """
     real_open = getattr(ydl, "urlopen", None)
-    if real_open is None:
+    if real_open is None or getattr(ydl, "_scribe_public_only", False):
         return
 
     def guarded(req, *args, **kwargs):
@@ -557,6 +565,51 @@ def public_only(ydl) -> None:
         return real_open(req, *args, **kwargs)
 
     ydl.urlopen = guarded
+    build_director = getattr(ydl, "build_request_director", None)
+    if build_director is not None:
+        if "_request_director" in vars(ydl):
+            # Already built (a cached_property): close what it opened first.
+            ydl._request_director.close()
+        ydl._request_director = build_director([_public_urllib_handler()])
+    ydl._scribe_public_only = True
+
+
+@functools.cache
+def _public_urllib_handler():
+    """yt-dlp's urllib request handler, judging every redirect it follows.
+
+    Why only this handler: yt-dlp prefers `requests` (and `curl_cffi` when it
+    is installed), and both follow redirects inside their own sessions, where
+    nothing outside can see the hop. The urllib handler follows them through
+    an `urllib.request.OpenerDirector`, whose redirect step `_guard_opener`
+    can wrap. yt-dlp supports running on urllib alone - it is what its
+    ``prefer-legacy-http-handler`` option selects - so an unattended feed
+    loses connection reuse, not features.
+
+    Built on first use, because importing yt-dlp is what `build_ydl` exists
+    to put off.
+    """
+    from yt_dlp.networking._urllib import UrllibRH
+    from yt_dlp.networking.exceptions import RequestError
+
+    class PublicUrllibRH(UrllibRH):
+        # The key YoutubeDL looks its urllib handler up by (its `_opener`,
+        # its "file:// URLs are disabled" message), so it still finds it.
+        RH_KEY = "Urllib"
+
+        def _create_instance(self, *args, **kwargs):
+            return _guard_opener(super()._create_instance(*args, **kwargs))
+
+        def _send(self, request):
+            try:
+                return super()._send(request)
+            except UrlError as refused:
+                # The director reports anything that is not a RequestError
+                # as a yt-dlp bug ("please report this issue"); a refused hop
+                # is a failed request, in the guard's own words.
+                raise RequestError(str(refused), cause=refused) from refused
+
+    return PublicUrllibRH
 
 
 def _request_url(req) -> str:
@@ -577,17 +630,29 @@ def _request_url(req) -> str:
     return str(req)
 
 
-class _PublicRedirects(HTTPRedirectHandler):
-    """Judges every hop, not just the first: a public URL may not 302 home.
+def _guard_opener(opener):
+    """``opener``, judging every hop, not just the first: a public URL may not 302 home.
 
     `redirect_request` is where urllib decides the next hop, so the check
     lives there - refusing by raising, which urllib surfaces as an error on
-    the request rather than a redirect it followed.
+    the request rather than a redirect it followed. It is wrapped on the
+    handler the opener already holds rather than replaced by a subclass,
+    because the same function guards two openers: discovery's own and the
+    one yt-dlp's urllib handler builds with its own redirect handler, which
+    has to keep its redirect rules (GitHub #41).
     """
+    for handler in opener.handlers:
+        if isinstance(handler, HTTPRedirectHandler):
+            handler.redirect_request = _judging_hops(handler.redirect_request)
+    return opener
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+
+def _judging_hops(redirect_request):
+    def judged(req, fp, code, msg, headers, newurl):
         _require_public_target(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return redirect_request(req, fp, code, msg, headers, newurl)
+
+    return judged
 
 
 def fetch_page(url: str, *, limit: int, public: bool = False) -> tuple[str, str]:
@@ -609,7 +674,7 @@ def fetch_page(url: str, *, limit: int, public: bool = False) -> tuple[str, str]
     )
     if public:
         _require_public_target(url)
-        open_url = build_opener(_PublicRedirects()).open
+        open_url = _guard_opener(build_opener()).open
     else:
         open_url = urlopen
     with open_url(request, timeout=DISCOVERY_TIMEOUT) as response:  # noqa: S310 - scheme checked by the caller
