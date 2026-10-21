@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Callable, Sequence
 from urllib.parse import urldefrag
@@ -55,6 +56,22 @@ and the transcriptions behind them. Twenty-five is a fortnight of a daily
 podcast and several months of a weekly one, so a feed that genuinely raced
 ahead still catches up over a few polls, while a feed that broke its own
 identity stops at something a person can look at and undo."""
+
+POLL_LISTING_LIMIT = 20 * MAX_NEW_PER_POLL
+"""How many entries a poll asks the probe for (`playlistend`), newest first.
+
+A poll only has to see what appeared since the last check, plus whatever a
+capped poll left for the next one; both sit at the top of the listing.
+Twenty polls' worth is 500: a daily podcast left unchecked for over a year
+still catches up, 25 a check. GitHub #36: it was `limit=None`, which had
+yt-dlp page through every entry of a channel with hundreds of thousands, and
+then `known_sources` bound two SQL variables per entry - past 16383 entries
+SQLite's "too many SQL variables" (32766), raised outside the probe's
+`try`, so the feed was never recorded and stayed due on every wake. For a
+paginated channel this bounds the work; an RSS feed is one document read
+whole, so there it bounds only the answer, and `PROBE_TIMEOUT_SECONDS` is
+what bounds the time. `backfill`'s "everything" still asks for all: that is
+a person's explicit request, capped by `url_stage.MAX_FAN_OUT`."""
 
 DEFAULT_INTERVAL_SECONDS = 86400
 """A day. Robert asked for daily or at startup, and due-dates give both."""
@@ -466,7 +483,7 @@ def poll(
         _record(conn, feed_id, result=stored[:200], failed=True, now=stamp)
         return {"queued": [], "new": 0, "error": result}
     try:
-        info = probe(feed["url"], limit=None)
+        info = probe(feed["url"], limit=POLL_LISTING_LIMIT)
     except Exception as exc:  # noqa: BLE001 - any failure is the feed's failure
         result = f"{type(exc).__name__}: {exc}"
         _record(conn, feed_id, result=result[:200], failed=True, now=stamp)
@@ -546,12 +563,27 @@ at once. Nothing about a daily feed rewards that.
 TICK_BUDGET_SECONDS = 180.0
 """How long one wake may spend polling feeds before the rest wait a wake.
 
-Feeds are polled serially: a host that answers slowly - not hung, which
-`urls.SOCKET_TIMEOUT` already bounds per request, just slow - would otherwise
-hold every later feed hostage for as long as it takes. Whatever the budget
-does not reach stays due: `checked_at` is only stamped for feeds the tick got
-to, so the next wake picks up exactly where this one stopped. Three minutes
-is a few slow feeds' worth, and comfortably inside the five-minute wake.
+Feeds are polled serially: a string of slow hosts would otherwise hold every
+later feed hostage for as long as they take. Checked between feeds, so it
+cannot stop a probe already running; `PROBE_TIMEOUT_SECONDS` bounds each one.
+Whatever the budget does not reach stays due: `checked_at` is only stamped
+for feeds the tick got to, so the next wake picks up exactly where this one
+stopped. Three minutes is a few slow feeds' worth, and comfortably inside the
+five-minute wake.
+"""
+
+PROBE_TIMEOUT_SECONDS = 60.0
+"""How long the watcher waits for one feed's probe before giving up on it.
+
+GitHub #36. `urls.SOCKET_TIMEOUT` bounds one socket read, not the probe: a
+host that drips a byte every few seconds never trips it, and a listing that
+keeps answering runs as long as it has entries. So the probe runs on a
+worker thread and the tick waits this long; past it the feed is recorded as
+failed, like a probe that raised, and the tick goes on to the next feed.
+`POLL_LISTING_LIMIT` entries of a channel take about 12 s at the measured 40
+a second, so a minute is five times a healthy poll, and the same minute the
+dialog's patient preview gives a listing (`ingest_ui.PATIENT_TIMEOUT_SECONDS`).
+Read at call time: the tests patch it.
 """
 
 
@@ -689,6 +721,9 @@ class FeedWatcher:
         self._probe = probe
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # The probe thread of each feed's last poll, by feed id. Read and
+        # written only by the tick, on this watcher's thread (GitHub #36).
+        self._probing: dict[int, threading.Thread] = {}
 
     def start(self) -> None:
         """Start the tick on a daemon thread (idempotent)."""
@@ -722,6 +757,51 @@ class FeedWatcher:
             return
         self._thread = None
 
+    def _bounded(
+        self, feed_id: int, probe: Callable[..., urls.UrlInfo]
+    ) -> Callable[..., urls.UrlInfo]:
+        """`probe` with a wall clock on it: run on a worker thread, given up on
+        after `PROBE_TIMEOUT_SECONDS` with a `TimeoutError` that `poll` records
+        like any other failed probe (GitHub #36).
+
+        Only the probe runs on the worker - network I/O and nothing else. The
+        recording, `known_sources` and the queueing stay in `poll` on this
+        watcher's thread and connection, so a worker that answers after it was
+        given up on writes nothing: its result falls into a Future nobody
+        reads.
+
+        A daemon thread rather than a subprocess, which could be killed:
+        `probe` is passed in (the tests hand it a closure, which a spawned
+        child cannot unpickle), a child would pay an interpreter start and a
+        yt-dlp import per feed, and `UrlInfo` would have to cross back pickled.
+        What a thread cannot be is stopped, so it is remembered in `_probing`
+        and its feed is skipped while it lives - at most one stuck thread per
+        feed, and `urls.SOCKET_TIMEOUT` still ends one whose host goes silent.
+        The same trade `ingest_ui.probe_or_none` makes for the dialog.
+        """
+
+        def bounded(url: str, **kwargs) -> urls.UrlInfo:
+            outcome: Future = Future()
+
+            def run() -> None:
+                try:
+                    outcome.set_result(probe(url, **kwargs))
+                except BaseException as exc:  # noqa: BLE001 - handed to the tick as is
+                    outcome.set_exception(exc)
+
+            worker = threading.Thread(target=run, name=f"scribe-feed-{feed_id}", daemon=True)
+            self._probing[feed_id] = worker
+            worker.start()
+            worker.join(PROBE_TIMEOUT_SECONDS)
+            if worker.is_alive():
+                raise TimeoutError(
+                    f"did not answer within {PROBE_TIMEOUT_SECONDS:g} s; tried again"
+                    " at the next check"
+                )
+            return outcome.result()
+
+        return bounded
+
     def tick(self, conn: sqlite3.Connection) -> int:
         """Check every feed that is due; returns how many were checked.
 
@@ -729,7 +809,9 @@ class FeedWatcher:
         that feed its turn and nothing else. And the wake itself is bounded
         (`TICK_BUDGET_SECONDS`): a string of slow feeds spends the budget and
         stops, leaving the rest due for the next wake rather than stacking an
-        afternoon of polling in front of them.
+        afternoon of polling in front of them. The budget is looked at between
+        feeds; one probe that hangs is bounded by `PROBE_TIMEOUT_SECONDS`
+        (GitHub #36).
         """
         due = due_feeds(conn)
         if not due:
@@ -741,11 +823,22 @@ class FeedWatcher:
         for feed in due:
             if checked and time.monotonic() >= deadline:
                 break
+            feed_id = int(feed["id"])
+            previous = self._probing.get(feed_id)
+            if previous is not None and previous.is_alive():
+                # Its last probe was given up on and is still running. Left
+                # due and unrecorded rather than probed a second time: the
+                # timeout already counted as its failure, and another thread
+                # every wake is how hung workers would pile up (GitHub #36).
+                continue
+            self._probing.pop(feed_id, None)
             # `poll` takes its collaborators by keyword, so the call is bound
             # here and handed to `_survive` as one thunk. Wrapped per feed and
             # not per tick: a podcast whose host is down costs that feed its
             # turn, not the others theirs.
-            _survive(_poll_one, conn, feed, probe, known_sources, options)
+            _survive(
+                _poll_one, conn, feed, self._bounded(feed_id, probe), known_sources, options
+            )
             checked += 1
         return checked
 

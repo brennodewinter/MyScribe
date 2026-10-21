@@ -340,3 +340,125 @@ def test_stop_keeps_a_thread_that_will_not_join(capsys):
     assert "still running" in capsys.readouterr().err
     hold.set()
     thread.join()
+
+
+# --- a feed that never answers (GitHub #36) ---------------------------------------
+
+HUNG_URL = "https://example.test/hung.xml"
+FINE_URL = "https://example.test/fine.xml"
+
+
+def _hanging_on(hung_url, release, calls):
+    """A probe that does not come back for one feed - a host dripping bytes,
+    which no socket timeout ends - and answers at once for every other."""
+
+    def probe(url, **kwargs):
+        calls.append(url)
+        if url == hung_url:
+            release.wait()
+        return playlist(entry(1))
+
+    return probe
+
+
+def _tick_in_background(watcher, conn):
+    """`watcher.tick` on a helper thread, with an Event that says it came back.
+
+    The test waits on the Event with a timeout instead of calling tick
+    directly: on code without a per-poll bound the tick never returns, and the
+    test has to fail on that rather than hang the suite.
+    """
+    import threading
+
+    done = threading.Event()
+
+    def run():
+        try:
+            watcher.tick(conn)
+        finally:
+            done.set()
+
+    helper = threading.Thread(target=run, daemon=True)
+    helper.start()
+    return helper, done
+
+
+def test_a_feed_that_never_answers_does_not_starve_the_others(conn, monkeypatch):
+    """TICK_BUDGET_SECONDS is looked at between feeds, so a probe that is
+    already hung held the one feed thread and every feed behind it stayed due.
+    The bound is per poll: the hung feed is recorded as failed, like a probe
+    that raised, and the tick goes on to the next."""
+    import threading
+
+    monkeypatch.setattr(feeds, "PROBE_TIMEOUT_SECONDS", 0.3, raising=False)
+    hung_id = feeds.subscribe(conn, HUNG_URL, answered=True)  # first, so polled first
+    fine_id = feeds.subscribe(conn, FINE_URL, answered=True)
+    release, calls = threading.Event(), []
+    watcher = feeds.FeedWatcher("never-opened.db", probe=_hanging_on(HUNG_URL, release, calls))
+
+    helper, done = _tick_in_background(watcher, conn)
+    try:
+        assert done.wait(10.0), f"the tick never came back; probed so far: {calls}"
+        assert calls == [HUNG_URL, FINE_URL]
+        fine = _feed(conn, fine_id)
+        assert fine["failures"] == 0 and fine["last_result"] == "1 new"
+        hung = _feed(conn, hung_id)
+        assert hung["failures"] == 1
+        assert "did not answer" in hung["last_result"]
+        assert hung_id not in {f["id"] for f in feeds.due_feeds(conn)}
+    finally:
+        release.set()
+        helper.join(10.0)
+
+
+def test_a_feed_still_hung_from_last_time_is_skipped_not_probed_again(conn, monkeypatch):
+    """The abandoned probe thread cannot be stopped from outside, so a feed
+    whose last probe is still running is left out of the next tick: one stuck
+    thread per feed at most, not one more every wake."""
+    import threading
+
+    monkeypatch.setattr(feeds, "PROBE_TIMEOUT_SECONDS", 0.3, raising=False)
+    hung_id = feeds.subscribe(conn, HUNG_URL, answered=True)
+    release, calls = threading.Event(), []
+    watcher = feeds.FeedWatcher("never-opened.db", probe=_hanging_on(HUNG_URL, release, calls))
+    helpers = []
+    try:
+        helper, done = _tick_in_background(watcher, conn)
+        helpers.append(helper)
+        assert done.wait(10.0), "the tick never came back"
+        # Due again while the first probe still hangs - a short interval, or
+        # a laptop that slept through the day.
+        conn.execute("UPDATE feed SET checked_at=NULL WHERE id=?", (hung_id,))
+        conn.commit()
+
+        helper, done = _tick_in_background(watcher, conn)
+        helpers.append(helper)
+        assert done.wait(10.0), "the second tick never came back"
+
+        assert calls == [HUNG_URL]
+        assert hung_id in {f["id"] for f in feeds.due_feeds(conn)}
+    finally:
+        release.set()
+        for helper in helpers:
+            helper.join(10.0)
+
+
+def test_a_poll_asks_for_a_bounded_listing_not_the_whole_archive(conn):
+    """limit=None had yt-dlp page through every entry a channel has, and then
+    `known_sources` bound two SQL variables per entry: past 16383 entries that
+    is SQLite's "too many SQL variables" (limit 32766), raised outside the
+    probe's try, so the feed was never recorded and stayed due for ever. A
+    poll only needs the top of the listing, and asks for that."""
+    feed_id = feeds.subscribe(conn, FEED_URL, answered=True)
+    asked = []
+
+    def probe(url, **kwargs):
+        asked.append(kwargs.get("limit"))
+        return playlist(entry(1))
+
+    feeds.poll(
+        conn, _feed(conn, feed_id), probe=probe, known_sources=nothing_known, options=OPTIONS
+    )
+
+    assert len(asked) == 1 and asked[0] is not None
+    assert feeds.MAX_NEW_PER_POLL < asked[0] <= 16383
