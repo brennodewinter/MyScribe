@@ -47,7 +47,13 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.request import (
+    AbstractHTTPHandler,
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+    urlopen,
+)
 
 from scribe import glossary
 
@@ -496,7 +502,7 @@ def ensure_public_http_url(url: str) -> str:
     return text
 
 
-def resolves_private(host: str | None) -> bool:
+def resolves_private(host: str | None, addresses: list[str] | None = None) -> bool:
     """Does ``host`` resolve to an address outside the public internet?
 
     The fetch-time half of `is_local_host`: the literal spelling is judged
@@ -505,9 +511,15 @@ def resolves_private(host: str | None) -> bool:
     actually made - which is why `public_only` calls this per request rather
     than `ensure_public_http_url` calling it once.
 
+    ``addresses`` are answers already looked up - the ones a connection is
+    about to use (`_connect_checked`) - and are judged instead of asking again.
+
     A name that will not resolve answers False rather than refusing: it
     reaches nothing either way, and the fetch's own "could not resolve host"
-    says the truer thing. A literal answers by `ipaddress` without a lookup.
+    says the truer thing. That fail-open is safe only because the connection
+    judges its own lookup again before it connects (GitHub #41). The lookup
+    has no timeout of its own - the OS resolver's applies, as it does to the
+    connection's lookup. A literal answers by `ipaddress` without a lookup.
     """
     name = (host or "").strip()
     if not name:
@@ -516,22 +528,49 @@ def resolves_private(host: str | None) -> bool:
         return not ipaddress.ip_address(name).is_global
     except ValueError:
         pass
-    try:
-        answers = socket.getaddrinfo(name, None)
-    except OSError:
-        return False
-    return any(not ipaddress.ip_address(answer[4][0]).is_global for answer in answers)
+    if addresses is None:
+        try:
+            addresses = [answer[4][0] for answer in socket.getaddrinfo(name, None)]
+        except OSError:
+            return False
+    return any(not ipaddress.ip_address(address).is_global for address in addresses)
+
+
+def _refuse_private(what: str) -> UnsupportedUrl:
+    return UnsupportedUrl(
+        f"{what} resolves to this machine or the local network; "
+        "a feed or playlist cannot ask for that"
+    )
 
 
 def _require_public_target(url: str) -> str:
     """`ensure_public_http_url`, and the host must resolve publicly too."""
     text = ensure_public_http_url(url)
     if resolves_private(urlparse(text).hostname):
-        raise UnsupportedUrl(
-            f"{text} resolves to this machine or the local network; "
-            "a feed or playlist cannot ask for that"
-        )
+        raise _refuse_private(text)
     return text
+
+
+def _connect_checked(address, timeout, source_address=None):
+    """`socket.create_connection`, connecting only to answers it has judged.
+
+    Checking a name and then letting the connection look it up again leaves
+    a gap: a resolver can answer public to the check and private to the
+    connect (DNS rebinding, GitHub #41). Here the one lookup is both judged
+    and used - the socket goes to the very address that passed. TLS is not
+    affected: `http.client` still wraps the socket with the host *name*.
+    """
+    host, port = address[0], address[1]
+    answers = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if resolves_private(host, [answer[4][0] for answer in answers]):
+        raise _refuse_private(host)
+    error: OSError | None = None
+    for answer in answers:
+        try:
+            return socket.create_connection(answer[4][:2], timeout, source_address)
+        except OSError as exc:
+            error = exc
+    raise error or OSError(f"{host} has no address to connect to")
 
 
 def public_only(ydl) -> None:
@@ -548,9 +587,11 @@ def public_only(ydl) -> None:
     handler, yt-dlp's urllib one, whose redirect step judges every hop - see
     `_public_urllib_handler` for why that handler and not the others.
 
-    A resolver that answers differently at check time and connect time can
-    still race past these checks; pinning the connection to the address that
-    was checked would close that.
+    A resolver that answers differently at check time and connect time is
+    met by that handler too: it connects to the address it judged (see
+    `_guard_opener`). Two doors stay outside: a SOCKS or HTTP proxy, where
+    the proxy resolves the name, and a download yt-dlp hands to ffmpeg
+    (HLS/DASH), which opens its own connections.
 
     A `ydl` with no `urlopen` has no network path to guard - the test seam
     is built that way - and is left alone. Guarding twice is a no-op: `probe`
@@ -640,10 +681,18 @@ def _guard_opener(opener):
     because the same function guards two openers: discovery's own and the
     one yt-dlp's urllib handler builds with its own redirect handler, which
     has to keep its redirect rules (GitHub #41).
+
+    Its http(s) handlers connect through `_connect_checked` for the same
+    reason: every hop opens its own connection, and that connection goes to
+    the address that was judged. Not behind a proxy: the socket then goes to
+    the proxy, which may well live on this network, and the proxy does the
+    lookup - so there the URL and redirect checks are the whole guard.
     """
     for handler in opener.handlers:
         if isinstance(handler, HTTPRedirectHandler):
             handler.redirect_request = _judging_hops(handler.redirect_request)
+        if isinstance(handler, AbstractHTTPHandler):
+            handler.do_open = _connecting_checked(handler.do_open)
     return opener
 
 
@@ -653,6 +702,19 @@ def _judging_hops(redirect_request):
         return redirect_request(req, fp, code, msg, headers, newurl)
 
     return judged
+
+
+def _connecting_checked(do_open):
+    def opened(http_class, req, **kwargs):
+        def connection(*args, **conn_kwargs):
+            conn = http_class(*args, **conn_kwargs)
+            if not (req.has_proxy() or req._tunnel_host):
+                conn._create_connection = _connect_checked
+            return conn
+
+        return do_open(connection, req, **kwargs)
+
+    return opened
 
 
 def fetch_page(url: str, *, limit: int, public: bool = False) -> tuple[str, str]:

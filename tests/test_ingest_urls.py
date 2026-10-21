@@ -467,6 +467,74 @@ def test_a_followed_feeds_redirect_home_is_refused_at_the_hop(redirect_home):
     assert redirect_home.trap_hits == []
 
 
+@pytest.fixture
+def rebinding(monkeypatch):
+    """A name that answers public to the guard's lookup and loopback after.
+
+    The server on 127.0.0.1 stands in for whatever the second answer points
+    at. Nothing is allow-listed: a hit there is the guard checking one lookup
+    and connecting through another.
+    """
+    hits: list[str] = []
+
+    class Inside(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            body = b"the router's admin page"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Inside)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    lookups: list[str] = []
+    real_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(host, service, *args, **kwargs):
+        if host != "rebind.test":
+            return real_getaddrinfo(host, service, *args, **kwargs)
+        lookups.append(host)
+        answer = "93.184.216.34" if len(lookups) == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (answer, int(service or 0)))]
+
+    monkeypatch.setattr(urls.socket, "getaddrinfo", getaddrinfo)
+    try:
+        yield SimpleNamespace(url=f"http://rebind.test:{port}/admin", hits=hits, lookups=lookups)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_discovery_connects_to_the_address_it_checked(rebinding):
+    """GitHub #41, DNS rebinding: the check's lookup said public, the
+    connection's own lookup said loopback. The connection must use the
+    answer that was judged, so the second answer is judged too."""
+    with pytest.raises(urls.UnsupportedUrl, match="local network"):
+        urls.fetch_page(rebinding.url, limit=1000, public=True)
+
+    assert len(rebinding.lookups) >= 2, "the rebinding never happened"
+    assert rebinding.hits == []
+
+
+def test_a_followed_feeds_ydl_connects_to_the_address_it_checked(rebinding):
+    """The same race through a real YoutubeDL under `public_only`."""
+    from yt_dlp.networking.exceptions import RequestError
+
+    ydl = urls.build_ydl(urls.probe_opts())
+    urls.public_only(ydl)
+
+    with pytest.raises(RequestError, match="local network"):
+        ydl.urlopen(rebinding.url)
+
+    assert len(rebinding.lookups) >= 2, "the rebinding never happened"
+    assert rebinding.hits == []
+
+
 def test_a_followed_feeds_probe_never_reaches_the_redirect_target(redirect_home):
     """The same hop through the stage's own call: `probe(public=True)` with
     the real yt-dlp fails, and fails without touching this machine."""
