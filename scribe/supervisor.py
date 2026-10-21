@@ -180,6 +180,11 @@ def _darwin_process_started_at(pid: int) -> float | None:
 # two clocks are the same one here, but a claim and a spawn are not atomic.
 _PID_AGE_SLACK_SECONDS = 60.0
 
+# How long a claimed-but-not-yet-spawned row may sit before it is a leftover
+# and not a spawn in flight. The gap is one `_spawn` call - milliseconds - so
+# a minute is far past any real claim and far inside any restart.
+_CLAIM_SPAWN_GRACE_SECONDS = 60.0
+
 
 def _pid_is_younger_than_job(row) -> bool:
     """Did the process holding this row's pid start after the job did?
@@ -322,11 +327,15 @@ def reconcile(conn) -> int:
 
     Two things a bare pid cannot tell us, both found in the 2026-09-16 review:
 
-    * **No pid yet is not a dead pid.** `claim_next` publishes a job as
-      running with `pid=NULL` and the supervisor writes the child's pid a
-      moment later. A reconcile landing in that gap used to declare a job dead
-      that was about to start - and the runner's own verdict is then refused,
-      because `finish` only moves a row that is still running (TASK-064).
+    * **No pid yet is not a dead pid - inside the grace.** `claim_next`
+      publishes a job as running with `pid=NULL` and the supervisor writes
+      the child's pid a moment later. A reconcile landing in that gap used
+      to declare a job dead that was about to start - and the runner's own
+      verdict is then refused, because `finish` only moves a row that is
+      still running (TASK-064). Past `_CLAIM_SPAWN_GRACE_SECONDS` the same
+      row is the leftover of an app that died inside the gap, and takes the
+      verdict: its pid can never arrive, and leaving it `running` wedged
+      the queue behind `claim_next`'s NOT EXISTS for ever.
     * **A pid can be somebody else's.** Windows hands out pids again after a
       reboot, so a job interrupted by a power cut can find its pid held by an
       unrelated process and sit on running for ever. A process that started
@@ -338,13 +347,22 @@ def reconcile(conn) -> int:
         ).fetchall()
     count = 0
     for row in rows:
-        if row["pid"] is None and row["started_at"] is not None:
+        if (
+            row["pid"] is None
+            and row["started_at"] is not None
+            and time.time() - float(row["started_at"]) < _CLAIM_SPAWN_GRACE_SECONDS
+        ):
             # Claimed, not yet spawned: the supervisor owns this row and will
             # write the pid in a moment. `claim_next` (jobs.py:135) is the only
             # thing that sets a job running, and it always stamps started_at -
             # so a running row with neither pid nor start time is not a job in
             # that gap but a leftover, and keeps the old treatment.
             continue
+        # A claimed row still without a pid past the grace is a leftover from
+        # an app that died inside the claim-spawn gap: the only writer of the
+        # pid is gone, so nothing arrives for it and `pid_alive` below reads
+        # it as the dead pid it is. Left as `running`, it would hold
+        # `claim_next`'s NOT EXISTS against the whole queue for ever.
         if pid_alive(row["pid"]) and not _pid_is_younger_than_job(row):
             continue
         # A job somebody asked to stop, whose runner is now gone, was

@@ -425,6 +425,29 @@ def test_reconcile_flips_dead_and_absent_pid_running_jobs(conn):
         live.wait()
 
 
+def test_reconcile_flips_a_claimed_row_whose_pid_never_arrived(conn):
+    """A `running` row with `pid=NULL` and an old `started_at` is the leftover
+    of an app that died between claim and spawn: the only pid writer is gone,
+    and leaving it `running` wedges `claim_next`'s NOT EXISTS for ever. A fresh
+    one is a spawn in flight and is left alone."""
+    j_stale = jobs.enqueue(conn, "fake")
+    j_fresh = jobs.enqueue(conn, "fake")
+    conn.execute(
+        "UPDATE job SET status='running', pid=NULL, started_at=? WHERE id=?",
+        (time.time() - supervisor._CLAIM_SPAWN_GRACE_SECONDS - 1, j_stale),
+    )
+    conn.execute(
+        "UPDATE job SET status='running', pid=NULL, started_at=? WHERE id=?",
+        (time.time(), j_fresh),
+    )
+    conn.commit()
+
+    assert supervisor.reconcile(conn) == 1
+
+    assert _row(conn, j_stale)["status"] == "interrupted"
+    assert _row(conn, j_fresh)["status"] == "running"
+
+
 # --- pid_alive ----------------------------------------------------------------
 
 
