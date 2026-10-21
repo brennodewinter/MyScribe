@@ -205,3 +205,23 @@ def test_a_server_that_is_not_this_install_is_left_alone(install, started, tmp_p
 def test_nothing_running_is_nothing_to_stop(install, tmp_path):
     code, said = _run(install, _free_port(), tmp_path)
     assert code == NOT_RUNNING and said == ""
+
+
+def test_a_process_already_gone_when_it_is_ended_does_not_fail_the_stop(install, started, tmp_path):
+    """Two processes from the install folder, one the other's child: ending
+    the parent with its tree takes the child too, and the second taskkill
+    finds nothing. Windows PowerShell 5.1 turned that taskkill's "not found"
+    on stderr into a terminating error under ErrorActionPreference=Stop, and
+    the script exited 1 - "still running" - for a MyScribe that had stopped."""
+    shutil.copy(Path(r"C:\Windows\System32\PING.EXE"), install / "helper.exe")
+    parent = _orphan([str(install / "MyScribe.exe"), "/c", str(install / "helper.exe"), "-n", "120", "127.0.0.1"])
+    started.append(parent)
+    deadline = time.monotonic() + 10
+    while not _children(parent) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    child = _children(parent)[0]
+
+    code, said = _run(install, _free_port(), tmp_path)
+
+    assert code == STOPPED, said
+    assert _gone(parent) and _gone(child)
