@@ -1114,15 +1114,10 @@ def _last_params(conn: sqlite3.Connection, media_id: int) -> dict:
     if not isinstance(params, dict):
         return {}
 
-    # Two sieves, because the type filter alone was not enough. The row that
-    # started this was already a transcribe job carrying a chat request's
-    # params, so "the last transcribe request" copied it forward and every
-    # re-transcribe queued another doomed job. Keep only the keys a transcribe
-    # job has (options.PARAM_KEYS), and drop a model that is not a checkpoint -
-    # `model` is a valid key on both kinds of job, which is precisely why the
-    # name got this far. Dropping it falls back to the default tier, so a
-    # poisoned row heals instead of repeating itself.
-    kept = {key: value for key, value in params.items() if key in options.PARAM_KEYS}
-    if "model" in kept and not transcribe.is_speech_model(str(kept["model"])):
-        kept.pop("model")
-    return kept
+    # The sieves live in `options.replayable`, which exists for exactly this
+    # question: the row that started this was already a transcribe job
+    # carrying a chat request's params, so "the last transcribe request"
+    # copied it forward and every re-transcribe queued another doomed job.
+    # Keep only the keys a transcribe job has, and drop a model that is not a
+    # checkpoint - a poisoned row heals instead of repeating itself.
+    return options.replayable(params)

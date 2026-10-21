@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from scribe import accel, applog, cuda_setup, db, doctor, jobs, paths, stages_fake
+from scribe import accel, applog, cuda_setup, db, doctor, jobs, media, paths, stages_fake
 from scribe.ingest import urls
 from scribe.llm import privacy as llm_privacy
 from scribe.llm.base import ContextTooLong, LlmError
@@ -183,16 +183,6 @@ def _error_code(exc: BaseException) -> str:
     return "RUNTIME"
 
 
-def _media_duration(conn: sqlite3.Connection, job: dict) -> float:
-    if job.get("media_id"):
-        row = conn.execute(
-            "SELECT duration FROM media WHERE id=?", (job["media_id"],)
-        ).fetchone()
-        if row is not None and row["duration"]:
-            return float(row["duration"])
-    return 0.0
-
-
 def _media_path(conn: sqlite3.Connection, job: dict) -> Path | None:
     """Where this job's media actually sits on disk, or None if it has none."""
     if not job.get("media_id"):
@@ -275,7 +265,7 @@ def _run(conn: sqlite3.Connection, job_id: int) -> int:
                 # file has no media.duration until probe writes it, and
                 # eta_seconds discards every sample whose duration is 0 - so a
                 # duration captured up front meant the ETA never calibrated.
-                _media_duration(conn, job),
+                media.media_duration(conn, job.get("media_id")),
                 time.monotonic() - started,
             )
         if cancelled():  # flag raised during the final stage

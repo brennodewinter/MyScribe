@@ -61,6 +61,11 @@ from scribe.stages import finalize, probe, transcribe, url_stage
 _UPLOAD_FIELD = "file"
 _INGEST_JOB_TYPE = "transcribe"
 
+# The most /api/jobs ever hands out in one answer. The board itself pages
+# through job rows; this endpoint answers polls, and an unbounded read of a
+# table that only grows is an unbounded request.
+JOBS_LIST_LIMIT = 1000
+
 
 def _get_job(conn: sqlite3.Connection, job_id: int) -> sqlite3.Row:
     with db.LOCK:
@@ -374,15 +379,22 @@ def create_app(
         return {**row, "job_id": job_id}
 
     @app.get("/api/jobs")
-    def list_jobs(request: Request, status: str | None = None) -> list[dict]:
+    def list_jobs(request: Request, status: str | None = None, limit: int = 200) -> list[dict]:
         conn = request.app.state.conn
+        # Newest first, and never the whole table: the board's own fragment
+        # limits itself, and this endpoint answers polls - an unbounded read
+        # of a table that only grows was an unbounded request.
+        limit = min(max(1, limit), JOBS_LIST_LIMIT)
         with db.LOCK:
             if status:
                 rows = conn.execute(
-                    "SELECT * FROM job WHERE status=? ORDER BY id DESC", (status,)
+                    "SELECT * FROM job WHERE status=? ORDER BY id DESC LIMIT ?",
+                    (status, limit),
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM job ORDER BY id DESC").fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM job ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
         return [_job_out(conn, row) for row in rows]
 
     @app.get("/api/jobs/{job_id}")
