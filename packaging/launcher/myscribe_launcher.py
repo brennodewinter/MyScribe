@@ -1290,6 +1290,135 @@ def running_instance(port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+# --- stopping the one that runs (TASK-112.03) ----------------------------------
+
+
+STOP_WAIT = 60.0
+"""How long `--stop` waits for the app to end through its own stop route.
+
+The route's way out nests inside this: uvicorn finishes the open requests,
+the lifespan stops the feeds and the watcher, and the supervisor ends the
+runner's tree and requeues its job, joining for `REQUEUE_STOP_SECONDS` (20 s,
+`scribe/supervisor.py`). Past this the hard stop runs, inside which
+`AppProcess.stop` gives the app another `STOP_TIMEOUT`."""
+
+STOPPED = ("MyScribe stopped. A job that was running is back at the front of the queue and "
+           "starts over the next time MyScribe starts.")
+
+
+def read_health(port: int, timeout: float = 2.0) -> dict | None:
+    """What /health says, or None when nothing that is MyScribe answers."""
+    try:
+        with loopback_opener().open(health_url(port), timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return body if isinstance(body, dict) and body.get("ok") else None
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether a process with this pid still runs.
+
+    Never `os.kill(pid, 0)` on Windows: there it is TerminateProcess with exit
+    code 0, so the question would be the stop. A handle that waits for
+    nothing answers it instead; one this account may not open is a process
+    that runs (ctypes is standard library, ADR-011)."""
+    if IS_WINDOWS:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: it is there
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_gone(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.2)
+    return not pid_alive(pid)
+
+
+def end_tree(pid: int) -> None:
+    """End a process and what it started, the way `AppProcess.stop` does.
+
+    Given the launcher's pid, POSIX sends it SIGTERM alone: its own handler
+    stops the app's process group and exits 0, so a supervisor sees a clean
+    stop and does not start the server `--stop` just ended (TASK-112.02).
+    Given the app's pid, its session is ended - it leads one when a launcher
+    started it - or just the process when it does not."""
+    if IS_WINDOWS:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        return
+    try:
+        kill, target = (os.killpg, pid) if os.getpgid(pid) == pid else (os.kill, pid)
+        kill(target, signal.SIGTERM)
+        if not wait_gone(pid, STOP_TIMEOUT):
+            kill(target, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def stop_running(port: int, report: Callable[[str, str], None], wait: float = STOP_WAIT) -> int:
+    """`MyScribe --stop`: ask the MyScribe on ``port`` to stop, and end it
+    when it does not (TASK-112.03, ADR-028).
+
+    The route first, because only it puts the running job back in the queue;
+    the hard stop leaves that job to reconcile, which marks it interrupted,
+    and the sentence says so. Waits for the app's pid and not for the port:
+    uvicorn closes the listener before the lifespan has stopped the runner.
+    0 when nothing runs any more, 1 when something still does.
+    """
+    health = read_health(port)
+    if health is None:
+        report("status", f"MyScribe is not running at http://{HOST}:{port}/; nothing to stop.")
+        return 0
+    pid = health.get("pid")
+    if not isinstance(pid, int):
+        report("error", "This MyScribe is older than --stop. Quit it from its window, or end "
+                        "MyScribe in Task Manager or Activity Monitor.")
+        return 1
+    request = urllib.request.Request(f"http://{HOST}:{port}/api/shutdown", data=b"", method="POST")
+    try:
+        with loopback_opener().open(request, timeout=10) as response:
+            response.read()
+    except (OSError, ValueError) as error:
+        report("busy", f"The stop route did not answer ({error}); ending MyScribe instead.")
+    else:
+        report("busy", f"Asked MyScribe to stop; waiting up to {wait:g} s for it.")
+        if wait_gone(pid, wait):
+            report("status", STOPPED)
+            return 0
+        report("busy", f"MyScribe did not stop within {wait:g} s; ending it.")
+    launcher = health.get("launcher_pid")
+    end_tree(launcher if isinstance(launcher, int) else pid)
+    if wait_gone(pid, STOP_TIMEOUT):
+        report("status", "MyScribe was ended. A job that was running is marked interrupted; "
+                         "Retry on the jobs page starts it over.")
+        return 0
+    report("error", f"MyScribe (process {pid}) is still running and could not be ended.")
+    return 1
+
+
 def port_taken(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         try:
@@ -2906,7 +3035,10 @@ def run_window(layout: Layout, port: int, open_browser: bool, force_setup: bool 
                 result = None
             answer.put(result)
         if launch.app is not None and launch.app.proc is not None and not launch.app.alive():
-            status.set(f"MyScribe stopped; see {layout.logs_dir / 'app.log'}")
+            # 0 is a stop somebody asked for, from Settings or --stop
+            # (TASK-112.03): not a crash, and app.log has nothing to say.
+            status.set(STOPPED if launch.app.exit_code() == 0
+                       else f"MyScribe stopped; see {layout.logs_dir / 'app.log'}")
         root.after(200, pump)
 
     def on_tk(work: Callable):
@@ -3027,6 +3159,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--smoke", action="store_true", help="start the app, check /health and /, stop it (CI)")
     parser.add_argument("--version", action="store_true")
+    parser.add_argument("--stop", action="store_true",
+                        help="stop the MyScribe that runs on --port; its running job starts over "
+                             "at the next start")
     return parser
 
 
@@ -3073,6 +3208,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.version:  # before the location, which must not open a window for a version
         print(app_version(Layout(args.home or home_dir(), payload)))
         return 0
+    if args.stop:  # needs no home: the port names the MyScribe to stop
+        def said(state: str, text: str) -> None:
+            print(text, flush=True)
+            write_early([text])  # behind --windowed there is no stdout to read
+
+        return stop_running(args.port, said)
 
     problems: list[str] = []
     before_home = [True]

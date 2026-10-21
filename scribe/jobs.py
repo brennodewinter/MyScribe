@@ -185,6 +185,34 @@ def finish(
         return cur.rowcount == 1
 
 
+def requeue_running(conn: sqlite3.Connection, job_id: int) -> str | None:
+    """A deliberately stopped job back to the front of its priority (ADR-028).
+
+    Only for a row whose runner is already gone: a runner that can still write
+    would race this, and a queued row beside a live runner is two children on
+    one card at the next start. A cancel asked before the stop wins - that row
+    becomes cancelled. Returns the status the row came to rest in, or None
+    when it was not running.
+    """
+    with db.LOCK:
+        row = conn.execute(
+            "SELECT cancel_requested FROM job WHERE id=? AND status='running'", (job_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["cancel_requested"]:
+            finish(conn, job_id, "cancelled")
+            return "cancelled"
+        conn.execute(
+            f"UPDATE job SET status='queued', queue_seq={_FRONT_SEQ}, started_at=NULL,"
+            " pid=NULL, stage=NULL, stage_progress=0 WHERE id=? AND status='running'",
+            (job_id,),
+        )
+        conn.commit()
+    applog.log("job.requeued", job=job_id)
+    return "queued"
+
+
 def request_cancel(conn: sqlite3.Connection, job_id: int) -> None:
     """Set the cooperative cancel flag; a still-queued job dies instantly."""
     with db.LOCK:

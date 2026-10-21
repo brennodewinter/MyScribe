@@ -90,6 +90,9 @@ def main(argv: list[str] | None = None) -> None:
 
     app = create_app(start_supervisor=not args.no_supervisor)
     server = uvicorn.Server(uvicorn.Config(app, host=HOST, port=args.port))
+    # The stop route's way out: uvicorn's own flag, so the lifespan runs to
+    # its end - the same path Ctrl+C takes (TASK-112.03).
+    app.state.request_exit = lambda: setattr(server, "should_exit", True)
     if not args.no_browser:
         open_browser_when_ready(server, f"http://{HOST}:{args.port}/")
     server.run()

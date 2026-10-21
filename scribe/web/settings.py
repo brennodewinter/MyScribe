@@ -74,7 +74,7 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import RedirectResponse, Response
 
-from scribe import accel, autostart, credentials, db, doctor, fsbrowse, glossary, jobs, paths
+from scribe import accel, autostart, credentials, db, doctor, fsbrowse, glossary, jobs, paths, shutdown
 from scribe.exports.options import PRESETS
 from scribe.ingest import watching
 from scribe.llm import base as llm_base
@@ -870,6 +870,19 @@ async def set_autostart(request: Request) -> Response:
             status_code=500, detail=f"the login entry could not be changed: {refused}"
         ) from None
     return _autostart_answer(request, flash=FLASH_AUTOSTART_ON if wanted else FLASH_AUTOSTART_OFF)
+
+
+@router.post("/settings/stop", include_in_schema=False)
+def stop_myscribe(request: Request) -> Response:
+    """The Stop button: the stop route's ask, answered in words (TASK-112.03).
+
+    The fragment for htmx and the bare card otherwise: a 303 back to
+    /settings, as the other cards answer, would point at a server that is
+    on its way out.
+    """
+    stopped = shutdown.stop_requested(request)
+    return render(request, "_settings_stop.html", stopping=True,
+                  running_job=stopped["running_job"])
 
 
 # --- the CPU switch (TASK-092) ---------------------------------------------------------------
