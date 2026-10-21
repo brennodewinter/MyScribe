@@ -304,9 +304,9 @@ def test_resolves_private(monkeypatch):
     )
 
 
-def test_a_redirect_that_points_home_is_refused_at_the_hop(monkeypatch):
-    """`public_only` wraps ydl.urlopen, the one call every request - each
-    redirect included - goes through, so a 302 home is refused mid-fetch."""
+def test_a_request_that_points_home_is_refused_before_it_is_sent(monkeypatch):
+    """`public_only` wraps ydl.urlopen, which every request yt-dlp starts
+    goes through. Redirect hops do not - see the real-server tests below."""
     monkeypatch.setattr(
         urls.socket, "getaddrinfo",
         lambda *a, **k: [(socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))],
@@ -326,6 +326,34 @@ def test_a_redirect_that_points_home_is_refused_at_the_hop(monkeypatch):
     with pytest.raises(urls.UnsupportedUrl):
         ydl.urlopen(Request("http://169.254.169.254/latest/meta-data"))
     assert ydl.urls == ["https://cdn.example/episode.mp3"]
+
+
+def test_the_guard_reads_the_url_of_a_real_yt_dlp_request(monkeypatch):
+    """GitHub #41: yt-dlp hands its own `Request` to urlopen - it has `.url`,
+    no `.full_url`, and its str() is the object's repr. Read as a string, every
+    request a followed feed made was refused as "not a web address"."""
+    from yt_dlp.networking.common import Request as YtdlpRequest
+
+    monkeypatch.setattr(
+        urls.socket, "getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))],
+    )
+    opened = []
+
+    class Ydl:
+        def urlopen(self, req, *args, **kwargs):
+            opened.append(req)
+            return "response"
+
+    ydl = Ydl()
+    urls.public_only(ydl)
+
+    public = YtdlpRequest("https://cdn.example/episode.mp3")
+    assert ydl.urlopen(public) == "response"
+    assert ydl.urlopen("https://cdn.example/feed.xml") == "response"
+    with pytest.raises(urls.UnsupportedUrl):
+        ydl.urlopen(YtdlpRequest("http://169.254.169.254/latest/meta-data"))
+    assert opened == [public, "https://cdn.example/feed.xml"]
 
 
 def test_a_feed_jobs_fetch_runs_under_the_public_guard(conn, data_dir, monkeypatch):

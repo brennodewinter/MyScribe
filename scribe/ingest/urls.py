@@ -553,10 +553,28 @@ def public_only(ydl) -> None:
         return
 
     def guarded(req, *args, **kwargs):
-        _require_public_target(req.full_url if isinstance(req, Request) else str(req))
+        _require_public_target(_request_url(req))
         return real_open(req, *args, **kwargs)
 
     ydl.urlopen = guarded
+
+
+def _request_url(req) -> str:
+    """The URL of whatever was handed to ``urlopen``.
+
+    yt-dlp passes its own `yt_dlp.networking.common.Request`, which has
+    ``.url``, no ``.full_url``, and a str() that is its repr - read as a
+    string, every request was refused as "not a web address" (GitHub #41).
+    A urllib `Request` has ``.full_url``; a plain string is the URL. Anything
+    else falls through to str() and is refused, which is the safe way round.
+    """
+    if isinstance(req, str):
+        return req
+    for name in ("full_url", "url"):
+        url = getattr(req, name, None)
+        if isinstance(url, str):
+            return url
+    return str(req)
 
 
 class _PublicRedirects(HTTPRedirectHandler):
