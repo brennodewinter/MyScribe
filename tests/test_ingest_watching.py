@@ -2058,3 +2058,49 @@ def test_the_watch_card_says_nothing_of_the_kind_when_the_watcher_runs(conn):
 
     assert settings_ui.watch_context(conn, watcher=_Running())["watching"] is True
     assert settings_ui.watch_context(conn, watcher=None)["watching"] is False
+
+
+# --- a walk that loops back on itself (GitHub #40) --------------------------------
+
+
+def _junction(link: Path, target: Path) -> None:
+    """A directory junction: no administrator needed, and os.walk descends it
+    because os.path.islink is False for one."""
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                   check=True, capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows'")
+def test_a_junction_back_into_the_watched_folder_does_not_walk_it_again(tmp_path):
+    watched = tmp_path / "watched"
+    (watched / "inner").mkdir(parents=True)
+    (watched / "one.mp3").write_bytes(b"x")
+    (watched / "inner" / "two.mp3").write_bytes(b"x")
+    _junction(watched / "inner" / "loop", watched)
+
+    found = watching._walk(watched)
+
+    assert sorted(p.name for p in found) == ["one.mp3", "two.mp3"], found
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows'")
+def test_a_junction_to_a_sibling_does_not_take_that_folder_in_twice(tmp_path):
+    """A cycle through a sibling dragged its whole contents in again."""
+    watched = tmp_path / "watched"
+    (watched / "a").mkdir(parents=True)
+    (watched / "b").mkdir()
+    (watched / "b" / "kept.mp3").write_bytes(b"x")
+    _junction(watched / "a" / "to-b", watched / "b")
+
+    found = watching._walk(watched)
+
+    assert [p.name for p in found] == ["kept.mp3"], found
+
+
+def test_an_ordinary_tree_is_still_walked_whole(tmp_path):
+    watched = tmp_path / "watched"
+    for sub in ("x", "x/y", "z"):
+        (watched / sub).mkdir(parents=True)
+        (watched / sub / f"{sub.replace('/', '-')}.mp3").write_bytes(b"x")
+
+    assert sorted(p.name for p in watching._walk(watched)) == ["x-y.mp3", "x.mp3", "z.mp3"]

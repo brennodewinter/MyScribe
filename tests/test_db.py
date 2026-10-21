@@ -763,3 +763,86 @@ def test_unsubscribing_forgets_what_that_feed_had_seen(conn):
     conn.commit()
 
     assert conn.execute("SELECT COUNT(*) FROM feed_seen").fetchone()[0] == 0
+
+
+# --- a migration that fails half-way, a newer library, a slow writer -------------
+# GitHub #30, #31, #38.
+
+
+def test_a_migration_that_fails_half_way_leaves_nothing_and_the_next_start_completes(tmp_path, monkeypatch):
+    """#30: executescript committed each statement on its own, so the DDL
+    before the failure stayed while user_version did not move - and the next
+    start failed on `table ... already exists` for ever."""
+    path = tmp_path / "half.db"
+    last = db.SCHEMA_VERSION
+    broken = list(db._MIGRATIONS)
+    broken[last - 1] = broken[last - 1] + "\nSELECT * FROM a_table_that_is_not_there;\n"
+    monkeypatch.setattr(db, "_MIGRATIONS", broken)
+    conn = db.connect(path)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            db.migrate(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == last - 1
+        assert "watch_existing" not in {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}, "half a migration stayed"
+
+        monkeypatch.undo()
+        db.migrate(conn)  # the next start
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == last
+    finally:
+        conn.close()
+
+
+def test_a_library_from_a_newer_myscribe_is_refused_and_left_alone(tmp_path):
+    """#31: the range up to SCHEMA_VERSION is empty going down, so the app
+    served a schema it does not know without a word."""
+    path = tmp_path / "newer.db"
+    conn = db.connect(path)
+    try:
+        db.migrate(conn)
+        conn.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION + 1}")
+        conn.commit()
+
+        with pytest.raises(db.NewerSchema) as refused:
+            db.migrate(conn)
+
+        assert f"v{db.SCHEMA_VERSION + 1}" in str(refused.value)
+        assert "Update MyScribe" in str(refused.value)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION + 1
+    finally:
+        conn.close()
+
+
+def test_a_writer_slower_than_five_seconds_does_not_fail_the_next_commit(tmp_path):
+    """#38: busy_timeout was 5 s and nothing retried, so a bookkeeping write
+    behind a slow commit failed the job that had done its work."""
+    import threading
+    import time
+
+    from scribe import jobs
+
+    path = tmp_path / "busy.db"
+    setup = db.connect(path)
+    db.migrate(setup)
+    job_id = jobs.enqueue(setup, "fake")
+    setup.close()
+
+    held = threading.Event()
+
+    def slow_writer():
+        other = db.connect(path)
+        other.execute("BEGIN IMMEDIATE")
+        held.set()
+        time.sleep(6.5)
+        other.rollback()
+        other.close()
+
+    thread = threading.Thread(target=slow_writer)
+    thread.start()
+    held.wait(5)
+    conn = db.connect(path)
+    try:
+        assert jobs.finish(conn, job_id, "done") is True
+    finally:
+        conn.close()
+        thread.join()
